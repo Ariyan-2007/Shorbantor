@@ -77,9 +77,10 @@ async function loadFile(file: File, mode: ParseMode, myToken: number) {
       stats: {
         totalNodes: index.nodeCount,
         visibleCount: index.getVisibleCount(),
-        rootIds: index.getTopLevelIds(),
+        rootId: index.getRootId(),
         bytesTotal: file.size,
         elapsedMs: performance.now() - startTime,
+        maxDepth: index.computeMaxDepth(),
       },
     })
   } catch (err) {
@@ -113,10 +114,46 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
       post({ type: 'VISIBLE_COUNT_CHANGED', visibleCount: index.getVisibleCount() })
       return
     }
+    case 'SET_EXPANDED': {
+      index.setNodeExpanded(msg.nodeId, msg.expanded)
+      index.rebuildVisibleOrder()
+      post({ type: 'VISIBLE_COUNT_CHANGED', visibleCount: index.getVisibleCount() })
+      return
+    }
     case 'EXPAND_TO_DEPTH': {
       index.expandToDepth(msg.depth)
       index.rebuildVisibleOrder()
       post({ type: 'VISIBLE_COUNT_CHANGED', visibleCount: index.getVisibleCount() })
+      return
+    }
+    case 'SET_SEARCH': {
+      const { matchCount, visibleCount } = index.setSearchQuery(msg.query)
+      post({ type: 'SEARCH_RESULT', requestId: msg.requestId, matchCount, visibleCount })
+      return
+    }
+    case 'GET_MATCH_POSITION': {
+      post({ type: 'MATCH_POSITION', requestId: msg.requestId, position: index.getMatchPosition(msg.matchIndex) })
+      return
+    }
+    case 'GET_INSPECTOR_ROWS': {
+      const { rows, title } = index.getInspectorRows(msg.nodeId)
+      post({ type: 'INSPECTOR_ROWS', requestId: msg.requestId, rows, title })
+      return
+    }
+    case 'GET_ANCESTOR_CHAIN': {
+      post({ type: 'ANCESTOR_CHAIN', requestId: msg.requestId, crumbs: index.getAncestorChain(msg.nodeId) })
+      return
+    }
+    case 'GET_SUBTREE_TEXT': {
+      post({ type: 'SUBTREE_TEXT', requestId: msg.requestId, text: index.getSubtreeText(msg.nodeId) })
+      return
+    }
+    case 'GET_VALUE_TEXT': {
+      post({ type: 'VALUE_TEXT', requestId: msg.requestId, text: index.getValueText(msg.nodeId) })
+      return
+    }
+    case 'GET_NODE_PATH': {
+      post({ type: 'NODE_PATH', requestId: msg.requestId, path: index.getNodePath(msg.nodeId) })
       return
     }
   }
