@@ -13,6 +13,7 @@ export default function Toast({ toast }: { toast: ToastState | null }) {
         position: 'fixed',
         right: 18,
         bottom: 18,
+        zIndex: 100,
         display: 'flex',
         alignItems: 'center',
         gap: 10,

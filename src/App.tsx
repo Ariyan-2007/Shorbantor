@@ -6,28 +6,14 @@ import StatusFooter from './components/StatusFooter'
 import Toast, { type ToastState } from './components/Toast'
 import TreeViewer from './components/TreeViewer'
 import { useShorbantorParser } from './hooks/useShorbantorParser'
+import { prettyPrint } from './lib/format'
 import { applyTheme, type Theme } from './lib/theme'
 import type { AncestorCrumb, FlatNodeView, InspectorRow, ParseMode } from './types/schema'
-
-function xmlReformat(text: string): string {
-  let out = ''
-  let depth = 0
-  text
-    .replace(/>\s*</g, '><')
-    .replace(/</g, '\n<')
-    .split('\n')
-    .filter(Boolean)
-    .forEach((line) => {
-      if (/^<\//.test(line)) depth--
-      out += `${'  '.repeat(Math.max(0, depth))}${line}\n`
-      if (/^<[^!?/][^>]*[^/]>/.test(line) && !/<\/.+>$/.test(line)) depth++
-    })
-  return out.trim()
-}
 
 export default function App() {
   const [mode, setMode] = useState<ParseMode>('json')
   const [currentFile, setCurrentFile] = useState<File | null>(null)
+  const [rawText, setRawText] = useState('')
   const [theme, setTheme] = useState<Theme>('light')
   const [paneOpen, setPaneOpen] = useState(true)
   const [narrow, setNarrow] = useState(false)
@@ -145,7 +131,7 @@ export default function App() {
     if (!currentFile) return
     try {
       const text = await currentFile.text()
-      const out = mode === 'json' ? JSON.stringify(JSON.parse(text), null, 2) : xmlReformat(text)
+      const out = prettyPrint(text, mode)
       const file = new File([out], currentFile.name, { type: currentFile.type })
       beginLoad(file, mode)
       showToast('Formatted')
@@ -158,6 +144,7 @@ export default function App() {
     const file = new File([''], `empty.${mode}`, { type: mode === 'json' ? 'application/json' : 'application/xml' })
     beginLoad(file, mode)
     setCurrentFile(null)
+    setRawText('')
     showToast('Cleared')
   }, [mode, beginLoad, showToast])
 
@@ -310,7 +297,7 @@ export default function App() {
       />
 
       <main style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
-        {paneOpen && <RawInputPane mode={mode} onLoadText={handleLoadText} />}
+        {paneOpen && <RawInputPane mode={mode} value={rawText} onChange={setRawText} onLoadText={handleLoadText} />}
 
         <section style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minWidth: 0, background: 'var(--app-surface)' }}>
           <div style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>

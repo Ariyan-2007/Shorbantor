@@ -1,5 +1,7 @@
-import { type ChangeEvent, type DragEvent, useMemo, useState } from 'react'
+import { type ChangeEvent, type DragEvent, useEffect, useMemo, useState } from 'react'
+import { minifyText, prettyPrint } from '../lib/format'
 import type { ParseMode } from '../types/schema'
+import { IconCollapse, IconExpand } from './icons'
 
 interface ErrorInfo {
   msg: string
@@ -10,6 +12,8 @@ interface ErrorInfo {
 
 interface RawInputPaneProps {
   mode: ParseMode
+  value: string
+  onChange: (text: string) => void
   onLoadText: (text: string, mode: ParseMode) => void
 }
 
@@ -38,64 +42,60 @@ function errInfo(e: unknown, raw: string): ErrorInfo {
   return { msg: msg.replace(/\s+/g, ' '), line, col, snippet }
 }
 
-export default function RawInputPane({ mode, onLoadText }: RawInputPaneProps) {
-  const [raw, setRaw] = useState('')
+export default function RawInputPane({ mode, value, onChange, onLoadText }: RawInputPaneProps) {
   const [url, setUrl] = useState('')
   const [dragOver, setDragOver] = useState(false)
   const [fetchError, setFetchError] = useState<string | null>(null)
+  const [formatError, setFormatError] = useState<string | null>(null)
+  const [expanded, setExpanded] = useState(false)
+
+  useEffect(() => {
+    if (!expanded) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setExpanded(false)
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [expanded])
 
   const validity = useMemo(() => {
-    if (!raw.trim()) return { err: null as ErrorInfo | null, empty: true }
+    if (!value.trim()) return { err: null as ErrorInfo | null, empty: true }
     try {
-      if (mode === 'json') JSON.parse(raw)
+      if (mode === 'json') JSON.parse(value)
       else {
-        const doc = new DOMParser().parseFromString(raw, 'application/xml')
+        const doc = new DOMParser().parseFromString(value, 'application/xml')
         const pe = doc.querySelector('parsererror')
         if (pe) throw new Error(pe.textContent?.replace(/\s+/g, ' ').trim().slice(0, 180) ?? 'Malformed XML')
       }
       return { err: null as ErrorInfo | null, empty: false }
     } catch (e) {
-      return { err: errInfo(e, raw), empty: false }
+      return { err: errInfo(e, value), empty: false }
     }
-  }, [raw, mode])
+  }, [value, mode])
 
-  const bytes = new Blob([raw]).size
+  const bytes = new Blob([value]).size
   const sizeLabel = bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`
 
   const commit = (text: string) => {
-    setRaw(text)
+    onChange(text)
     if (text.trim()) onLoadText(text, mode)
   }
 
   const prettify = () => {
     try {
-      if (mode === 'json') setRaw(JSON.stringify(JSON.parse(raw), null, 2))
-      else {
-        let out = ''
-        let d = 0
-        raw
-          .replace(/>\s*</g, '><')
-          .replace(/</g, '\n<')
-          .split('\n')
-          .filter(Boolean)
-          .forEach((t) => {
-            if (/^<\//.test(t)) d--
-            out += '  '.repeat(Math.max(0, d)) + t + '\n'
-            if (/^<[^!?/][^>]*[^/]>/.test(t) && !/<\/.+>$/.test(t)) d++
-          })
-        setRaw(out.trim())
-      }
+      setFormatError(null)
+      onChange(prettyPrint(value, mode))
     } catch {
-      // Formatting is opportunistic — leave raw untouched on invalid input.
+      setFormatError(`Cannot prettify — fix the ${mode.toUpperCase()} error first`)
     }
   }
 
   const minify = () => {
     try {
-      if (mode === 'json') setRaw(JSON.stringify(JSON.parse(raw)))
-      else setRaw(raw.replace(/>\s+</g, '><').trim())
+      setFormatError(null)
+      onChange(minifyText(value, mode))
     } catch {
-      // Minifying is opportunistic — leave raw untouched on invalid input.
+      setFormatError(`Cannot minify — fix the ${mode.toUpperCase()} error first`)
     }
   }
 
@@ -120,16 +120,57 @@ export default function RawInputPane({ mode, onLoadText }: RawInputPaneProps) {
     file.text().then(commit)
   }
 
-  const handleChange = (e: ChangeEvent<HTMLTextAreaElement>) => setRaw(e.target.value)
+  const handleChange = (e: ChangeEvent<HTMLTextAreaElement>) => {
+    setFormatError(null)
+    onChange(e.target.value)
+  }
   const handleBlurCommit = () => {
-    if (raw.trim()) onLoadText(raw, mode)
+    if (value.trim()) onLoadText(value, mode)
   }
 
+  const sectionStyle = expanded
+    ? {
+        position: 'fixed' as const,
+        top: '4vh',
+        left: '6vw',
+        right: '6vw',
+        bottom: '4vh',
+        zIndex: 41,
+        display: 'flex',
+        flexDirection: 'column' as const,
+        minWidth: 0,
+        background: 'var(--app-bg)',
+        border: '1px solid var(--app-line)',
+        borderRadius: 'var(--radius-md)',
+        boxShadow: '0 20px 60px rgba(0,0,0,0.35)',
+      }
+    : {
+        flex: '0 0 380px',
+        display: 'flex',
+        flexDirection: 'column' as const,
+        minWidth: 0,
+        borderRight: '1px solid var(--app-line)',
+        background: 'var(--app-bg)',
+      }
+
   return (
-    <section style={{ flex: '0 0 380px', display: 'flex', flexDirection: 'column', minWidth: 0, borderRight: '1px solid var(--app-line)', background: 'var(--app-bg)' }}>
+    <>
+      {expanded && (
+        <div onClick={() => setExpanded(false)} style={{ position: 'fixed', inset: 0, background: 'rgba(15, 13, 10, 0.45)', zIndex: 40 }} />
+      )}
+      <section style={sectionStyle}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 12px 8px' }}>
         <h6 style={{ margin: 0, fontSize: 11, letterSpacing: '0.1em' }}>Raw input</h6>
         <span style={{ fontFamily: 'var(--app-mono)', fontSize: 10.5, color: 'var(--app-muted)', marginLeft: 'auto' }}>{sizeLabel}</span>
+        <button
+          className="btn btn-secondary btn-icon"
+          title={expanded ? 'Restore size' : 'Expand view'}
+          aria-label={expanded ? 'Restore raw input size' : 'Expand raw input view'}
+          onClick={() => setExpanded((v) => !v)}
+          style={{ width: 26, height: 26 }}
+        >
+          {expanded ? <IconCollapse size={13} /> : <IconExpand size={13} />}
+        </button>
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '0 12px 8px' }}>
@@ -182,7 +223,7 @@ export default function RawInputPane({ mode, onLoadText }: RawInputPaneProps) {
         <i className="corner br" />
         <textarea
           className="sb-ta"
-          value={raw}
+          value={value}
           onChange={handleChange}
           onBlur={handleBlurCommit}
           spellCheck={false}
@@ -195,8 +236,8 @@ export default function RawInputPane({ mode, onLoadText }: RawInputPaneProps) {
             background: 'transparent',
             padding: 12,
             fontFamily: 'var(--app-mono)',
-            fontSize: 12.5,
-            lineHeight: 1.65,
+            fontSize: expanded ? 14.5 : 12.5,
+            lineHeight: expanded ? 1.8 : 1.65,
             color: 'var(--app-ink)',
             tabSize: 2,
           }}
@@ -237,6 +278,13 @@ export default function RawInputPane({ mode, onLoadText }: RawInputPaneProps) {
           )}
         </div>
       )}
-    </section>
+
+      {!validity.err && formatError && (
+        <div style={{ margin: '0 12px 12px', padding: '8px 12px', border: '1px solid #b4693f', borderLeft: '3px solid #b4693f', background: '#fdf3ec' }}>
+          <div style={{ fontFamily: 'var(--app-mono)', fontSize: 12, color: '#6d3a1c' }}>{formatError}</div>
+        </div>
+      )}
+      </section>
+    </>
   )
 }
