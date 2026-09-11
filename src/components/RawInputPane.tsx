@@ -1,5 +1,6 @@
-import { type ChangeEvent, type DragEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { type ChangeEvent, type DragEvent, type UIEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { minifyText, prettyPrint } from '../lib/format'
+import { highlightRaw } from '../lib/highlight'
 import type { ParseMode } from '../types/schema'
 import { IconCollapse, IconCopy, IconExpand } from './icons'
 
@@ -94,6 +95,17 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
   const sizeLabel = bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`
 
   const lastLoadedRef = useRef<string | null>(null)
+  const highlightRef = useRef<HTMLDivElement>(null)
+
+  // Syntax highlighting is only rendered in the expanded view — it sits as a
+  // backdrop behind a transparent-text textarea so typing/selection stay native.
+  const segments = useMemo(() => (expanded ? highlightRaw(value, validity.effectiveMode) : null), [expanded, value, validity.effectiveMode])
+
+  const syncHighlightScroll = (e: UIEvent<HTMLTextAreaElement>) => {
+    if (!highlightRef.current) return
+    highlightRef.current.scrollTop = e.currentTarget.scrollTop
+    highlightRef.current.scrollLeft = e.currentTarget.scrollLeft
+  }
 
   const load = (text: string, loadMode: ParseMode) => {
     const key = `${loadMode}:${text}`
@@ -272,27 +284,56 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
         <i className="corner tr" />
         <i className="corner bl" />
         <i className="corner br" />
-        <textarea
-          className="sb-ta"
-          value={value}
-          onChange={handleChange}
-          onBlur={handleBlurCommit}
-          spellCheck={false}
-          placeholder="Paste JSON or XML — or drop a file here"
-          style={{
-            flex: '1 1 auto',
-            resize: 'none',
-            border: 0,
-            outline: 'none',
-            background: 'transparent',
-            padding: 12,
-            fontFamily: 'var(--app-mono)',
-            fontSize: expanded ? 14.5 : 12.5,
-            lineHeight: expanded ? 1.8 : 1.65,
-            color: 'var(--app-ink)',
-            tabSize: 2,
-          }}
-        />
+        <div style={{ position: 'relative', flex: '1 1 auto', minHeight: 0 }}>
+          {segments && (
+            <div
+              ref={highlightRef}
+              aria-hidden="true"
+              style={{
+                position: 'absolute',
+                inset: 0,
+                margin: 0,
+                overflow: 'auto',
+                pointerEvents: 'none',
+                padding: 12,
+                fontFamily: 'var(--app-mono)',
+                fontSize: 14.5,
+                lineHeight: 1.8,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                tabSize: 2,
+              }}
+            >
+              {segments.map((seg, i) => (seg.color ? <span key={i} style={{ color: seg.color }}>{seg.text}</span> : seg.text))}
+            </div>
+          )}
+          <textarea
+            className="sb-ta"
+            value={value}
+            onChange={handleChange}
+            onBlur={handleBlurCommit}
+            onScroll={segments ? syncHighlightScroll : undefined}
+            spellCheck={false}
+            placeholder="Paste JSON or XML — or drop a file here"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              resize: 'none',
+              border: 0,
+              outline: 'none',
+              background: 'transparent',
+              padding: 12,
+              fontFamily: 'var(--app-mono)',
+              fontSize: expanded ? 14.5 : 12.5,
+              lineHeight: expanded ? 1.8 : 1.65,
+              color: segments ? 'transparent' : 'var(--app-ink)',
+              caretColor: 'var(--app-ink)',
+              tabSize: 2,
+            }}
+          />
+        </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '8px 10px', borderTop: '1px solid var(--app-line)' }}>
           <button className="btn btn-secondary" onClick={prettify} style={{ fontSize: 12 }}>
             Prettify
