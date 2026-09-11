@@ -14,6 +14,7 @@ export type ParserStatus = 'idle' | 'loading' | 'ready' | 'error'
 export interface UseShorbantorParserResult {
   status: ParserStatus
   progress: number
+  loadingNodeCount: number
   error: string | null
   stats: ParseStats | null
   visibleCount: number
@@ -43,6 +44,7 @@ export function useShorbantorParser(): UseShorbantorParserResult {
 
   const [status, setStatus] = useState<ParserStatus>('idle')
   const [progress, setProgress] = useState(0)
+  const [loadingNodeCount, setLoadingNodeCount] = useState(0)
   const [error, setError] = useState<string | null>(null)
   const [stats, setStats] = useState<ParseStats | null>(null)
   const [visibleCount, setVisibleCount] = useState(0)
@@ -63,6 +65,7 @@ export function useShorbantorParser(): UseShorbantorParserResult {
       switch (msg.type) {
         case 'PROGRESS':
           setProgress(msg.total > 0 ? Math.min(100, (msg.loaded / msg.total) * 100) : 0)
+          setLoadingNodeCount(msg.nodeCount)
           return
         case 'PARSE_COMPLETE':
           setStats(msg.stats)
@@ -113,6 +116,7 @@ export function useShorbantorParser(): UseShorbantorParserResult {
     (file: File, mode: ParseMode) => {
       setStatus('loading')
       setProgress(0)
+      setLoadingNodeCount(0)
       setError(null)
       setStats(null)
       setVisibleCount(0)
@@ -210,6 +214,7 @@ export function useShorbantorParser(): UseShorbantorParserResult {
   return {
     status,
     progress,
+    loadingNodeCount,
     error,
     stats,
     visibleCount,

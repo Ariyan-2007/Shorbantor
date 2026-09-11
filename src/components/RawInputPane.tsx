@@ -1,7 +1,7 @@
-import { type ChangeEvent, type DragEvent, useEffect, useMemo, useState } from 'react'
+import { type ChangeEvent, type DragEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { minifyText, prettyPrint } from '../lib/format'
 import type { ParseMode } from '../types/schema'
-import { IconCollapse, IconExpand } from './icons'
+import { IconCollapse, IconCopy, IconExpand } from './icons'
 
 interface ErrorInfo {
   msg: string
@@ -15,6 +15,7 @@ interface RawInputPaneProps {
   value: string
   onChange: (text: string) => void
   onLoadText: (text: string, mode: ParseMode) => void
+  onCopy: (text: string, label: string) => void
 }
 
 function errInfo(e: unknown, raw: string): ErrorInfo {
@@ -42,7 +43,32 @@ function errInfo(e: unknown, raw: string): ErrorInfo {
   return { msg: msg.replace(/\s+/g, ' '), line, col, snippet }
 }
 
-export default function RawInputPane({ mode, value, onChange, onLoadText }: RawInputPaneProps) {
+function tryParse(text: string, m: ParseMode): ErrorInfo | null {
+  try {
+    if (m === 'json') {
+      JSON.parse(text)
+    } else {
+      const doc = new DOMParser().parseFromString(text, 'application/xml')
+      const pe = doc.querySelector('parsererror')
+      if (pe) throw new Error(pe.textContent?.replace(/\s+/g, ' ').trim().slice(0, 180) ?? 'Malformed XML')
+    }
+    return null
+  } catch (e) {
+    return errInfo(e, text)
+  }
+}
+
+/** Validates against the current mode first; if that fails but the text is valid in the other format, switches to it instead of surfacing an error. */
+function detectEffectiveMode(text: string, mode: ParseMode): { mode: ParseMode; err: ErrorInfo | null } {
+  const primaryErr = tryParse(text, mode)
+  if (!primaryErr) return { mode, err: null }
+  const other: ParseMode = mode === 'json' ? 'xml' : 'json'
+  const otherErr = tryParse(text, other)
+  if (!otherErr) return { mode: other, err: null }
+  return { mode, err: primaryErr }
+}
+
+export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy }: RawInputPaneProps) {
   const [url, setUrl] = useState('')
   const [dragOver, setDragOver] = useState(false)
   const [fetchError, setFetchError] = useState<string | null>(null)
@@ -59,27 +85,40 @@ export default function RawInputPane({ mode, value, onChange, onLoadText }: RawI
   }, [expanded])
 
   const validity = useMemo(() => {
-    if (!value.trim()) return { err: null as ErrorInfo | null, empty: true }
-    try {
-      if (mode === 'json') JSON.parse(value)
-      else {
-        const doc = new DOMParser().parseFromString(value, 'application/xml')
-        const pe = doc.querySelector('parsererror')
-        if (pe) throw new Error(pe.textContent?.replace(/\s+/g, ' ').trim().slice(0, 180) ?? 'Malformed XML')
-      }
-      return { err: null as ErrorInfo | null, empty: false }
-    } catch (e) {
-      return { err: errInfo(e, value), empty: false }
-    }
+    if (!value.trim()) return { err: null as ErrorInfo | null, empty: true, effectiveMode: mode }
+    const { mode: effectiveMode, err } = detectEffectiveMode(value, mode)
+    return { err, empty: false, effectiveMode }
   }, [value, mode])
 
   const bytes = new Blob([value]).size
   const sizeLabel = bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`
 
+  const lastLoadedRef = useRef<string | null>(null)
+
+  const load = (text: string, loadMode: ParseMode) => {
+    const key = `${loadMode}:${text}`
+    if (lastLoadedRef.current === key) return
+    lastLoadedRef.current = key
+    onLoadText(text, loadMode)
+  }
+
   const commit = (text: string) => {
     onChange(text)
-    if (text.trim()) onLoadText(text, mode)
+    if (text.trim()) load(text, detectEffectiveMode(text, mode).mode)
   }
+
+  // Auto-display as the user types — no need to blur or press Prettify.
+  // An empty box clears the tree immediately (and resets the dedupe key so a
+  // subsequent paste — even one identical to what was cleared — always reloads).
+  useEffect(() => {
+    if (!value.trim()) {
+      if (lastLoadedRef.current !== null) load('', mode)
+      return
+    }
+    const t = window.setTimeout(() => load(value, validity.effectiveMode), 350)
+    return () => window.clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value, validity.effectiveMode, mode])
 
   const prettify = () => {
     try {
@@ -125,7 +164,7 @@ export default function RawInputPane({ mode, value, onChange, onLoadText }: RawI
     onChange(e.target.value)
   }
   const handleBlurCommit = () => {
-    if (value.trim()) onLoadText(value, mode)
+    if (value.trim()) load(value, validity.effectiveMode)
   }
 
   const sectionStyle = expanded
@@ -162,6 +201,18 @@ export default function RawInputPane({ mode, value, onChange, onLoadText }: RawI
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 12px 8px' }}>
         <h6 style={{ margin: 0, fontSize: 11, letterSpacing: '0.1em' }}>Raw input</h6>
         <span style={{ fontFamily: 'var(--app-mono)', fontSize: 10.5, color: 'var(--app-muted)', marginLeft: 'auto' }}>{sizeLabel}</span>
+        {expanded && (
+          <button
+            className="btn btn-secondary btn-icon"
+            title={`Copy ${mode.toUpperCase()}`}
+            aria-label={`Copy raw ${mode.toUpperCase()}`}
+            onClick={() => onCopy(value, 'Raw input')}
+            disabled={!value.trim()}
+            style={{ width: 26, height: 26 }}
+          >
+            <IconCopy size={13} />
+          </button>
+        )}
         <button
           className="btn btn-secondary btn-icon"
           title={expanded ? 'Restore size' : 'Expand view'}
@@ -258,7 +309,13 @@ export default function RawInputPane({ mode, value, onChange, onLoadText }: RawI
               textAlign: 'right',
             }}
           >
-            {validity.err ? `INVALID ${mode.toUpperCase()}` : validity.empty ? 'AWAITING INPUT' : `VALID ${mode.toUpperCase()}`}
+            {validity.err
+              ? `INVALID ${mode.toUpperCase()}`
+              : validity.empty
+                ? 'AWAITING INPUT'
+                : validity.effectiveMode !== mode
+                  ? `DETECTED ${validity.effectiveMode.toUpperCase()}`
+                  : `VALID ${mode.toUpperCase()}`}
           </span>
         </div>
       </div>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import AppHeader from './components/AppHeader'
+import LoadingIndicator from './components/LoadingIndicator'
 import NodeInspector from './components/NodeInspector'
 import RawInputPane from './components/RawInputPane'
 import StatusFooter from './components/StatusFooter'
@@ -38,6 +39,7 @@ export default function App() {
   const {
     status,
     progress,
+    loadingNodeCount,
     error,
     stats,
     visibleCount,
@@ -110,6 +112,18 @@ export default function App() {
   useEffect(() => {
     applyTheme('light')
   }, [])
+
+  // Small delay avoids a loader flash on quick, small-file loads — it only
+  // ever shows once a parse has genuinely been running for a moment.
+  const [showLoader, setShowLoader] = useState(false)
+  useEffect(() => {
+    if (status !== 'loading') {
+      setShowLoader(false)
+      return
+    }
+    const t = window.setTimeout(() => setShowLoader(true), 200)
+    return () => window.clearTimeout(t)
+  }, [status])
 
   // ---- header actions (operate on the whole loaded document) ---------------
 
@@ -297,11 +311,17 @@ export default function App() {
       />
 
       <main style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
-        {paneOpen && <RawInputPane mode={mode} value={rawText} onChange={setRawText} onLoadText={handleLoadText} />}
+        {paneOpen && <RawInputPane mode={mode} value={rawText} onChange={setRawText} onLoadText={handleLoadText} onCopy={copy} />}
 
         <section style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minWidth: 0, background: 'var(--app-surface)' }}>
           <div style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
-            {status === 'idle' || status === 'ready' || status === 'loading' ? (
+            {status === 'loading' && showLoader ? (
+              <LoadingIndicator progress={progress} nodeCount={loadingNodeCount} />
+            ) : status === 'error' ? (
+              <div style={{ flex: '1 1 auto', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--app-muted)', fontFamily: 'var(--app-mono)', fontSize: 12 }}>
+                {error}
+              </div>
+            ) : (
               <TreeViewer
                 visibleCount={visibleCount}
                 getVisibleNodes={getVisibleNodes}
@@ -316,10 +336,6 @@ export default function App() {
                 query={query}
                 jumpToIndex={jumpToIndex}
               />
-            ) : (
-              <div style={{ flex: '1 1 auto', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--app-muted)', fontFamily: 'var(--app-mono)', fontSize: 12 }}>
-                {error ?? `Streaming and indexing your file… ${progress.toFixed(0)}%`}
-              </div>
             )}
 
             {!narrow && (
