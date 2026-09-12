@@ -1,37 +1,80 @@
 import type { IndexBuilder } from './builderTypes'
 
-type State =
-  | 'VALUE'
-  | 'AFTER_VALUE'
-  | 'OBJECT_KEY_START'
-  | 'OBJECT_AFTER_KEY'
-  | 'OBJECT_AFTER_COLON'
-  | 'ARRAY_START'
-  | 'STRING'
-  | 'STRING_ESCAPE'
-  | 'STRING_UNICODE'
-  | 'NUMBER'
-  | 'LITERAL'
-  | 'DONE'
+/**
+ * States are plain numeric constants rather than a string union: the feed()
+ * switch runs once per *token run* (not per character), but the comparison
+ * still sits in the hottest loop in the app and integer dispatch lets the JIT
+ * compile it to a jump table.
+ */
+const S_VALUE = 0
+const S_AFTER_VALUE = 1
+const S_OBJECT_KEY_START = 2
+const S_OBJECT_AFTER_KEY = 3
+const S_OBJECT_AFTER_COLON = 4
+const S_ARRAY_START = 5
+const S_STRING = 6
+const S_STRING_ESCAPE = 7
+const S_STRING_UNICODE = 8
+const S_NUMBER = 9
+const S_LITERAL = 10
+const S_DONE = 11
 
-interface Frame {
-  kind: 'object' | 'array'
+const CH_TAB = 9
+const CH_LF = 10
+const CH_CR = 13
+const CH_SPACE = 32
+const CH_QUOTE = 34
+const CH_PLUS = 43
+const CH_COMMA = 44
+const CH_MINUS = 45
+const CH_DOT = 46
+const CH_0 = 48
+const CH_9 = 57
+const CH_COLON = 58
+const CH_UPPER_E = 69
+const CH_LBRACKET = 91
+const CH_BACKSLASH = 92
+const CH_RBRACKET = 93
+const CH_LOWER_E = 101
+const CH_F = 102
+const CH_N = 110
+const CH_T = 116
+const CH_LBRACE = 123
+const CH_RBRACE = 125
+
+const FRAME_OBJECT = 0
+const FRAME_ARRAY = 1
+
+function isWs(c: number): boolean {
+  return c === CH_SPACE || c === CH_LF || c === CH_TAB || c === CH_CR
 }
 
-const WS = new Set([0x20, 0x09, 0x0a, 0x0d])
+function isNumberCode(c: number): boolean {
+  return (c >= CH_0 && c <= CH_9) || c === CH_DOT || c === CH_PLUS || c === CH_MINUS || c === CH_LOWER_E || c === CH_UPPER_E
+}
 
 /**
  * Hand-rolled streaming (SAX-style) JSON lexer. feed() may be called with
  * arbitrarily-sized chunks — all state needed to resume mid-token (a string,
- * a number, a partial escape sequence) is carried across calls, so the
- * caller never needs to buffer the whole document and JSON.parse() is never
- * invoked.
+ * a number, a partial escape sequence) is carried across calls, so the caller
+ * never needs to buffer the whole document and JSON.parse() is never invoked.
+ *
+ * Scanning is *run-based*, not character-based: each loop turn locates the end
+ * of a whole token run (a string body, a number, a whitespace gap) with a tight
+ * charCodeAt loop and then takes a single slice. The naive one-character-at-a-
+ * time form allocated a fresh one-char JS string per byte of input and appended
+ * it to a rope — order 1.5M allocations per MB — which dominated parse time and
+ * GC pressure. `pending` only accumulates when a token genuinely straddles a
+ * chunk boundary, which is rare, so the common path slices each token exactly
+ * once and never concatenates at all.
  */
 export class JsonStreamTokenizer {
-  private state: State = 'VALUE'
-  private stack: Frame[] = []
+  private state: number = S_VALUE
+  /** FRAME_OBJECT / FRAME_ARRAY per open container — numeric so V8 keeps it a packed SMI array. */
+  private stack: number[] = []
   private pendingKey: string | null = null
-  private buf = ''
+  /** Carry buffer for a token split across feed() calls; empty on the common path. */
+  private pending = ''
   private literalExpect = ''
   private unicodeDigits = ''
   private stringIsKey = false
@@ -42,21 +85,117 @@ export class JsonStreamTokenizer {
   }
 
   feed(chunk: string) {
-    for (let i = 0; i < chunk.length; i++) {
-      this.consumeChar(chunk.charCodeAt(i), chunk[i])
+    const n = chunk.length
+    let i = 0
+
+    while (i < n) {
+      switch (this.state) {
+        case S_STRING: {
+          // Bulk-scan the string body up to the next quote or escape.
+          const start = i
+          let c = 0
+          let closed = false
+          while (i < n) {
+            c = chunk.charCodeAt(i)
+            if (c === CH_QUOTE || c === CH_BACKSLASH) {
+              closed = true
+              break
+            }
+            i++
+          }
+          const run = i > start ? chunk.slice(start, i) : ''
+          if (!closed) {
+            // Ran out of chunk mid-string — carry the partial body forward.
+            this.pending = this.pending === '' ? run : this.pending + run
+            return
+          }
+          i++
+          if (c === CH_QUOTE) {
+            this.finishString(this.pending === '' ? run : this.pending + run)
+            this.pending = ''
+          } else {
+            this.pending = this.pending === '' ? run : this.pending + run
+            this.state = S_STRING_ESCAPE
+          }
+          break
+        }
+
+        case S_STRING_ESCAPE: {
+          this.consumeStringEscape(chunk[i])
+          i++
+          break
+        }
+
+        case S_STRING_UNICODE: {
+          // Take all four hex digits at once when they sit in this chunk.
+          const need = 4 - this.unicodeDigits.length
+          const take = Math.min(need, n - i)
+          this.unicodeDigits += chunk.slice(i, i + take)
+          i += take
+          if (this.unicodeDigits.length === 4) {
+            this.pending += String.fromCharCode(parseInt(this.unicodeDigits, 16))
+            this.unicodeDigits = ''
+            this.state = S_STRING
+          }
+          break
+        }
+
+        case S_NUMBER: {
+          const start = i
+          while (i < n && isNumberCode(chunk.charCodeAt(i))) i++
+          const run = i > start ? chunk.slice(start, i) : ''
+          if (i === n) {
+            // Number may continue into the next chunk — it is only complete
+            // once a non-number character actually terminates it.
+            this.pending = this.pending === '' ? run : this.pending + run
+            return
+          }
+          this.finishNumber(this.pending === '' ? run : this.pending + run)
+          this.pending = ''
+          break
+        }
+
+        case S_LITERAL: {
+          const expect = this.literalExpect
+          while (i < n && this.pending.length < expect.length) {
+            this.pending += chunk[i]
+            i++
+            if (!expect.startsWith(this.pending)) {
+              throw new Error(`Invalid literal near "${this.pending}"`)
+            }
+          }
+          if (this.pending.length === expect.length) {
+            this.finishLiteral()
+            this.pending = ''
+          }
+          break
+        }
+
+        default: {
+          // Structural states: skip whitespace in bulk, then dispatch one char.
+          while (i < n && isWs(chunk.charCodeAt(i))) i++
+          if (i >= n) return
+          const c = chunk.charCodeAt(i)
+          i++
+          this.consumeStructural(c, chunk[i - 1])
+          break
+        }
+      }
     }
   }
 
   end() {
-    if (this.state === 'NUMBER') {
-      this.finishNumber()
-    } else if (this.state === 'LITERAL') {
-      if (this.buf !== this.literalExpect) {
-        throw new Error(`Unexpected end of input inside literal "${this.buf}"`)
+    if (this.state === S_NUMBER) {
+      this.finishNumber(this.pending)
+      this.pending = ''
+    } else if (this.state === S_LITERAL) {
+      if (this.pending !== this.literalExpect) {
+        throw new Error(`Unexpected end of input inside literal "${this.pending}"`)
       }
       this.finishLiteral()
+      this.pending = ''
     }
-    if (this.state !== 'DONE' && this.stack.length > 0) {
+    if (this.state !== S_DONE && this.stack.length > 0) {
       throw new Error('Unexpected end of input: unclosed object or array')
     }
   }
@@ -67,124 +206,103 @@ export class JsonStreamTokenizer {
     return key
   }
 
-  private currentFrame(): Frame | null {
-    return this.stack.length ? this.stack[this.stack.length - 1] : null
-  }
-
   private afterValueOrEnd() {
-    this.state = this.stack.length === 0 ? 'DONE' : 'AFTER_VALUE'
+    this.state = this.stack.length === 0 ? S_DONE : S_AFTER_VALUE
   }
 
-  private consumeChar(code: number, ch: string) {
+  /** Handles exactly one significant character in a non-accumulating state. */
+  private consumeStructural(c: number, ch: string) {
     switch (this.state) {
-      case 'VALUE':
-        this.consumeValueStart(code, ch)
+      case S_VALUE:
+      case S_OBJECT_AFTER_COLON:
+        this.consumeValueStart(c, ch)
         return
-      case 'OBJECT_KEY_START':
-        if (WS.has(code)) return
-        if (ch === '}') {
+
+      case S_OBJECT_KEY_START:
+        if (c === CH_RBRACE) {
           this.closeContainer()
           return
         }
-        if (ch === '"') {
-          this.state = 'STRING'
-          this.buf = ''
+        if (c === CH_QUOTE) {
+          this.state = S_STRING
+          this.pending = ''
           this.stringIsKey = true
           return
         }
         throw new Error(`Unexpected token "${ch}" while expecting an object key`)
-      case 'OBJECT_AFTER_KEY':
-        if (WS.has(code)) return
-        if (ch === ':') {
-          this.state = 'OBJECT_AFTER_COLON'
+
+      case S_OBJECT_AFTER_KEY:
+        if (c === CH_COLON) {
+          this.state = S_OBJECT_AFTER_COLON
           return
         }
         throw new Error(`Expected ':' after key, got "${ch}"`)
-      case 'OBJECT_AFTER_COLON':
-        this.consumeValueStart(code, ch)
-        return
-      case 'ARRAY_START':
-        if (WS.has(code)) return
-        if (ch === ']') {
+
+      case S_ARRAY_START:
+        if (c === CH_RBRACKET) {
           this.closeContainer()
           return
         }
-        this.consumeValueStart(code, ch)
+        this.consumeValueStart(c, ch)
         return
-      case 'AFTER_VALUE':
-        if (WS.has(code)) return
-        if (ch === ',') {
-          const frame = this.currentFrame()
-          if (!frame) throw new Error('Unexpected "," at top level')
-          this.state = frame.kind === 'object' ? 'OBJECT_KEY_START' : 'ARRAY_START'
+
+      case S_AFTER_VALUE:
+        if (c === CH_COMMA) {
+          if (this.stack.length === 0) throw new Error('Unexpected "," at top level')
+          this.state = this.stack[this.stack.length - 1] === FRAME_OBJECT ? S_OBJECT_KEY_START : S_ARRAY_START
           return
         }
-        if (ch === '}' || ch === ']') {
+        if (c === CH_RBRACE || c === CH_RBRACKET) {
           this.closeContainer()
           return
         }
         throw new Error(`Unexpected token "${ch}" after value`)
-      case 'STRING':
-        this.consumeStringChar(ch)
-        return
-      case 'STRING_ESCAPE':
-        this.consumeStringEscape(ch)
-        return
-      case 'STRING_UNICODE':
-        this.consumeUnicodeDigit(ch)
-        return
-      case 'NUMBER':
-        this.consumeNumberChar(code, ch)
-        return
-      case 'LITERAL':
-        this.consumeLiteralChar(ch)
-        return
-      case 'DONE':
+
+      case S_DONE:
         return
     }
   }
 
-  private consumeValueStart(code: number, ch: string) {
-    if (WS.has(code)) return
-    if (ch === '{') {
+  private consumeValueStart(c: number, ch: string) {
+    if (c === CH_LBRACE) {
       this.builder.openContainer('object', this.consumeKeyIfAny())
-      this.stack.push({ kind: 'object' })
-      this.state = 'OBJECT_KEY_START'
+      this.stack.push(FRAME_OBJECT)
+      this.state = S_OBJECT_KEY_START
       return
     }
-    if (ch === '[') {
+    if (c === CH_LBRACKET) {
       this.builder.openContainer('array', this.consumeKeyIfAny())
-      this.stack.push({ kind: 'array' })
-      this.state = 'ARRAY_START'
+      this.stack.push(FRAME_ARRAY)
+      this.state = S_ARRAY_START
       return
     }
-    if (ch === '"') {
-      this.state = 'STRING'
-      this.buf = ''
+    if (c === CH_QUOTE) {
+      this.state = S_STRING
+      this.pending = ''
       this.stringIsKey = false
       return
     }
-    if (ch === '-' || (code >= 48 && code <= 57)) {
-      this.buf = ch
-      this.state = 'NUMBER'
+    if (c === CH_MINUS || (c >= CH_0 && c <= CH_9)) {
+      this.pending = ch
+      this.state = S_NUMBER
       return
     }
-    if (ch === 't') {
+    if (c === CH_T) {
       this.literalExpect = 'true'
-      this.buf = 't'
-      this.state = 'LITERAL'
+      this.pending = 't'
+      this.state = S_LITERAL
       return
     }
-    if (ch === 'f') {
+    if (c === CH_F) {
       this.literalExpect = 'false'
-      this.buf = 'f'
-      this.state = 'LITERAL'
+      this.pending = 'f'
+      this.state = S_LITERAL
       return
     }
-    if (ch === 'n') {
+    if (c === CH_N) {
       this.literalExpect = 'null'
-      this.buf = 'n'
-      this.state = 'LITERAL'
+      this.pending = 'n'
+      this.state = S_LITERAL
       return
     }
     throw new Error(`Unexpected token "${ch}" at start of value`)
@@ -196,24 +314,10 @@ export class JsonStreamTokenizer {
     this.afterValueOrEnd()
   }
 
-  private consumeStringChar(ch: string) {
-    if (ch === '"') {
-      this.finishString()
-      return
-    }
-    if (ch === '\\') {
-      this.state = 'STRING_ESCAPE'
-      return
-    }
-    this.buf += ch
-  }
-
-  private finishString() {
-    const value = this.buf
-    this.buf = ''
+  private finishString(value: string) {
     if (this.stringIsKey) {
       this.pendingKey = value
-      this.state = 'OBJECT_AFTER_KEY'
+      this.state = S_OBJECT_AFTER_KEY
     } else {
       this.builder.addLeaf('string', this.consumeKeyIfAny(), value)
       this.afterValueOrEnd()
@@ -223,89 +327,54 @@ export class JsonStreamTokenizer {
   private consumeStringEscape(ch: string) {
     switch (ch) {
       case '"':
-        this.buf += '"'
-        this.state = 'STRING'
+        this.pending += '"'
+        this.state = S_STRING
         return
       case '\\':
-        this.buf += '\\'
-        this.state = 'STRING'
+        this.pending += '\\'
+        this.state = S_STRING
         return
       case '/':
-        this.buf += '/'
-        this.state = 'STRING'
+        this.pending += '/'
+        this.state = S_STRING
         return
       case 'b':
-        this.buf += '\b'
-        this.state = 'STRING'
+        this.pending += '\b'
+        this.state = S_STRING
         return
       case 'f':
-        this.buf += '\f'
-        this.state = 'STRING'
+        this.pending += '\f'
+        this.state = S_STRING
         return
       case 'n':
-        this.buf += '\n'
-        this.state = 'STRING'
+        this.pending += '\n'
+        this.state = S_STRING
         return
       case 'r':
-        this.buf += '\r'
-        this.state = 'STRING'
+        this.pending += '\r'
+        this.state = S_STRING
         return
       case 't':
-        this.buf += '\t'
-        this.state = 'STRING'
+        this.pending += '\t'
+        this.state = S_STRING
         return
       case 'u':
         this.unicodeDigits = ''
-        this.state = 'STRING_UNICODE'
+        this.state = S_STRING_UNICODE
         return
       default:
         throw new Error(`Invalid escape sequence "\\${ch}"`)
     }
   }
 
-  private consumeUnicodeDigit(ch: string) {
-    this.unicodeDigits += ch
-    if (this.unicodeDigits.length === 4) {
-      this.buf += String.fromCharCode(parseInt(this.unicodeDigits, 16))
-      this.state = 'STRING'
-    }
-  }
-
-  private isNumberChar(ch: string): boolean {
-    return (ch >= '0' && ch <= '9') || ch === '.' || ch === '+' || ch === '-' || ch === 'e' || ch === 'E'
-  }
-
-  private consumeNumberChar(code: number, ch: string) {
-    if (this.isNumberChar(ch)) {
-      this.buf += ch
-      return
-    }
-    this.finishNumber()
-    this.consumeChar(code, ch)
-  }
-
-  private finishNumber() {
-    const value = this.buf
-    this.buf = ''
+  private finishNumber(value: string) {
     this.builder.addLeaf('number', this.consumeKeyIfAny(), value)
     this.afterValueOrEnd()
   }
 
-  private consumeLiteralChar(ch: string) {
-    this.buf += ch
-    if (!this.literalExpect.startsWith(this.buf)) {
-      throw new Error(`Invalid literal near "${this.buf}"`)
-    }
-    if (this.buf.length === this.literalExpect.length) {
-      this.finishLiteral()
-    }
-  }
-
   private finishLiteral() {
     const type = this.literalExpect === 'null' ? 'null' : 'boolean'
-    const value = this.literalExpect
-    this.buf = ''
-    this.builder.addLeaf(type, this.consumeKeyIfAny(), value)
+    this.builder.addLeaf(type, this.consumeKeyIfAny(), this.literalExpect)
     this.afterValueOrEnd()
   }
 }

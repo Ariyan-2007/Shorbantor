@@ -1,8 +1,26 @@
-import { type ChangeEvent, type DragEvent, type UIEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { type ChangeEvent, type DragEvent, type UIEvent, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { minifyText, prettyPrint } from '../lib/format'
 import { highlightRaw } from '../lib/highlight'
 import type { ParseMode } from '../types/schema'
 import { IconCollapse, IconCopy, IconExpand } from './icons'
+
+/**
+ * Above this, the syntax-highlight backdrop is dropped and the textarea renders
+ * plain text. highlightRaw() emits one React element per token, so a 1.5 MB
+ * payload became ~250k DOM nodes — tens of MB of DOM, seconds of reconciliation
+ * on every keystroke, and in practice a hung or crashed tab. Editing, parsing
+ * and the tree view are unaffected; only the colored backdrop turns off.
+ */
+const HIGHLIGHT_MAX_BYTES = 128 * 1024
+
+/**
+ * Above this, the pane stops running its own JSON.parse/DOMParser pass and
+ * reports whatever the worker's streaming parse found instead. The pane's parse
+ * exists purely to put a line/column on an error — it is redundant with the
+ * worker for everything else, and at multi-MB sizes it is a full second parse
+ * (plus, for XML, a whole throwaway DOM) on the UI thread.
+ */
+const VALIDATE_MAX_BYTES = 2 * 1024 * 1024
 
 interface ErrorInfo {
   msg: string
@@ -17,6 +35,45 @@ interface RawInputPaneProps {
   onChange: (text: string) => void
   onLoadText: (text: string, mode: ParseMode) => void
   onCopy: (text: string, label: string) => void
+  /** Parse failure reported by the worker, used when the text is too large to re-validate here. */
+  parseError: string | null
+}
+
+/** FNV-1a over the text, so the "already loaded this" check costs 4 bytes instead of a full copy. */
+function hashText(s: string): number {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return h >>> 0
+}
+
+/**
+ * Exact UTF-8 byte count. Blob is the fastest exact option a browser offers
+ * (a hand-rolled charCodeAt loop measured slower), so the fix for the original
+ * cost is not a different algorithm but calling it far less: this now runs off
+ * the deferred value and memoized, rather than on every single render.
+ */
+function utf8Length(s: string): number {
+  return new Blob([s]).size
+}
+
+/**
+ * Picks the format from the first meaningful character instead of parsing the
+ * document twice to find out. '<' can only start XML; '{' and '[' can only
+ * start JSON. Anything else (a bare string or number) keeps the current mode,
+ * which is what a full-parse probe concluded anyway.
+ */
+function sniffMode(text: string, fallback: ParseMode): ParseMode {
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i)
+    if (c === 32 || c === 9 || c === 10 || c === 13) continue
+    if (c === 60) return 'xml'
+    if (c === 123 || c === 91) return 'json'
+    return fallback
+  }
+  return fallback
 }
 
 function errInfo(e: unknown, raw: string): ErrorInfo {
@@ -59,17 +116,7 @@ function tryParse(text: string, m: ParseMode): ErrorInfo | null {
   }
 }
 
-/** Validates against the current mode first; if that fails but the text is valid in the other format, switches to it instead of surfacing an error. */
-function detectEffectiveMode(text: string, mode: ParseMode): { mode: ParseMode; err: ErrorInfo | null } {
-  const primaryErr = tryParse(text, mode)
-  if (!primaryErr) return { mode, err: null }
-  const other: ParseMode = mode === 'json' ? 'xml' : 'json'
-  const otherErr = tryParse(text, other)
-  if (!otherErr) return { mode: other, err: null }
-  return { mode, err: primaryErr }
-}
-
-export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy }: RawInputPaneProps) {
+export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy, parseError }: RawInputPaneProps) {
   const [url, setUrl] = useState('')
   const [dragOver, setDragOver] = useState(false)
   const [fetchError, setFetchError] = useState<string | null>(null)
@@ -85,21 +132,56 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
     return () => document.removeEventListener('keydown', onKey)
   }, [expanded])
 
-  const validity = useMemo(() => {
-    if (!value.trim()) return { err: null as ErrorInfo | null, empty: true, effectiveMode: mode }
-    const { mode: effectiveMode, err } = detectEffectiveMode(value, mode)
-    return { err, empty: false, effectiveMode }
-  }, [value, mode])
+  // Typing updates `value` at once so the textarea always stays responsive;
+  // the expensive derived work below runs against the deferred copy at lower
+  // priority and React can abandon it mid-flight when the next keystroke lands.
+  const deferredValue = useDeferredValue(value)
 
-  const bytes = new Blob([value]).size
-  const sizeLabel = bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`
+  const bytes = useMemo(() => utf8Length(deferredValue), [deferredValue])
+  const sizeLabel = bytes < 1024 ? `${bytes} B` : bytes < 1048576 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1048576).toFixed(2)} MB`
+
+  const validity = useMemo(() => {
+    if (!deferredValue.trim()) return { err: null as ErrorInfo | null, empty: true, effectiveMode: mode, checked: true }
+    const effectiveMode = sniffMode(deferredValue, mode)
+    if (bytes > VALIDATE_MAX_BYTES) {
+      // Too large to re-parse here; the worker already told us whether it parsed.
+      const err = parseError ? { msg: parseError, line: 0, col: 0, snippet: '' } : null
+      return { err, empty: false, effectiveMode, checked: false }
+    }
+    return { err: tryParse(deferredValue, effectiveMode), empty: false, effectiveMode, checked: true }
+  }, [deferredValue, mode, parseError, bytes])
 
   const lastLoadedRef = useRef<string | null>(null)
   const highlightRef = useRef<HTMLDivElement>(null)
+  const taRef = useRef<HTMLTextAreaElement>(null)
+
+  /**
+   * The textarea is deliberately uncontrolled. A controlled one re-assigns
+   * .value on every render, and assigning a multi-megabyte string forces the
+   * browser to re-lay-out the entire document's text. Letting the DOM own the
+   * text means typing costs only an incremental edit.
+   *
+   * Comparing against what the element currently holds is the whole guard:
+   * while typing, the DOM already has exactly `value`, so nothing is written;
+   * any update from elsewhere (prettify, minify, fetch, drop, clear) differs
+   * and is written through. An earlier version also tracked the last typed
+   * string and skipped writes matching it, which silently dropped legitimate
+   * updates that happened to reproduce previously typed text — minifying
+   * already-minified input, or re-dropping a file after Clear.
+   */
+  useEffect(() => {
+    const el = taRef.current
+    if (!el) return
+    if (el.value !== value) el.value = value
+  }, [value])
 
   // Syntax highlighting is only rendered in the expanded view — it sits as a
   // backdrop behind a transparent-text textarea so typing/selection stay native.
-  const segments = useMemo(() => (expanded ? highlightRaw(value, validity.effectiveMode) : null), [expanded, value, validity.effectiveMode])
+  const highlightTooBig = bytes > HIGHLIGHT_MAX_BYTES
+  const segments = useMemo(
+    () => (expanded && !highlightTooBig ? highlightRaw(deferredValue, validity.effectiveMode) : null),
+    [expanded, highlightTooBig, deferredValue, validity.effectiveMode],
+  )
 
   const syncHighlightScroll = (e: UIEvent<HTMLTextAreaElement>) => {
     if (!highlightRef.current) return
@@ -107,8 +189,11 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
     highlightRef.current.scrollLeft = e.currentTarget.scrollLeft
   }
 
+  // Identify what was last loaded by a hash rather than by the text itself —
+  // the old key held a second full copy of the document alive for the lifetime
+  // of the pane, doubling the resident cost of every paste.
   const load = (text: string, loadMode: ParseMode) => {
-    const key = `${loadMode}:${text}`
+    const key = `${loadMode}:${text.length}:${hashText(text)}`
     if (lastLoadedRef.current === key) return
     lastLoadedRef.current = key
     onLoadText(text, loadMode)
@@ -116,7 +201,7 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
 
   const commit = (text: string) => {
     onChange(text)
-    if (text.trim()) load(text, detectEffectiveMode(text, mode).mode)
+    if (text.trim()) load(text, sniffMode(text, mode))
   }
 
   // Auto-display as the user types — no need to blur or press Prettify.
@@ -309,7 +394,8 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
           )}
           <textarea
             className="sb-ta"
-            value={value}
+            ref={taRef}
+            defaultValue={value}
             onChange={handleChange}
             onBlur={handleBlurCommit}
             onScroll={segments ? syncHighlightScroll : undefined}
@@ -356,15 +442,26 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
                 ? 'AWAITING INPUT'
                 : validity.effectiveMode !== mode
                   ? `DETECTED ${validity.effectiveMode.toUpperCase()}`
-                  : `VALID ${mode.toUpperCase()}`}
+                  : validity.checked
+                    ? `VALID ${mode.toUpperCase()}`
+                    : `PARSED ${validity.effectiveMode.toUpperCase()}`}
           </span>
         </div>
+        {highlightTooBig && expanded && (
+          <div style={{ padding: '0 10px 8px', fontFamily: 'var(--app-mono)', fontSize: 10.5, color: 'var(--app-muted)' }}>
+            SYNTAX COLORING OFF ABOVE {HIGHLIGHT_MAX_BYTES / 1024} KB — EDITING AND THE TREE ARE UNAFFECTED
+          </div>
+        )}
       </div>
 
       {(validity.err || fetchError) && (
         <div style={{ margin: '0 12px 12px', padding: '10px 12px', border: '1px solid #b4693f', borderLeft: '3px solid #b4693f', background: '#fdf3ec' }}>
           <div style={{ fontFamily: 'var(--app-mono)', fontSize: 11, letterSpacing: '0.08em', color: '#8a4520' }}>
-            {validity.err ? `PARSE ERROR · LINE ${validity.err.line}, COL ${validity.err.col}` : 'FETCH ERROR'}
+            {validity.err
+              ? validity.checked
+                ? `PARSE ERROR · LINE ${validity.err.line}, COL ${validity.err.col}`
+                : 'PARSE ERROR'
+              : 'FETCH ERROR'}
           </div>
           <div style={{ fontFamily: 'var(--app-mono)', fontSize: 12, lineHeight: 1.5, color: '#6d3a1c', marginTop: 4 }}>
             {validity.err ? validity.err.msg : fetchError}

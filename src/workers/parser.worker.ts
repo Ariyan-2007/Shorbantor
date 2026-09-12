@@ -89,8 +89,25 @@ async function loadFile(file: File, mode: ParseMode, myToken: number) {
   }
 }
 
+/**
+ * Any single request can fail on a pathological document — the clearest case
+ * being a subtree whose serialized form exceeds the engine's maximum string
+ * length. Left unhandled that becomes an uncaught worker error: the worker
+ * dies, every in-flight request's promise never settles, and the UI hangs with
+ * no explanation. Failing one request instead keeps the session alive.
+ */
 self.onmessage = (event: MessageEvent<WorkerRequest>) => {
-  const msg = event.data
+  try {
+    handleRequest(event.data)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    const requestId = 'requestId' in event.data ? event.data.requestId : undefined
+    if (requestId === undefined) post({ type: 'ERROR', message })
+    else post({ type: 'REQUEST_FAILED', requestId, message })
+  }
+}
+
+function handleRequest(msg: WorkerRequest) {
   switch (msg.type) {
     case 'LOAD_FILE': {
       loadToken += 1

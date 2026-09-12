@@ -16,6 +16,9 @@ export interface UseShorbantorParserResult {
   progress: number
   loadingNodeCount: number
   error: string | null
+  /** Last failure of an individual worker operation; the document stays loaded and usable. */
+  opError: string | null
+  clearOpError: () => void
   stats: ParseStats | null
   visibleCount: number
   loadFile: (file: File, mode: ParseMode) => void
@@ -48,6 +51,9 @@ export function useShorbantorParser(): UseShorbantorParserResult {
   const [error, setError] = useState<string | null>(null)
   const [stats, setStats] = useState<ParseStats | null>(null)
   const [visibleCount, setVisibleCount] = useState(0)
+  const [opError, setOpError] = useState<string | null>(null)
+
+  const clearOpError = useCallback(() => setOpError(null), [])
 
   useEffect(() => {
     const worker = new Worker(new URL('../workers/parser.worker.ts', import.meta.url), { type: 'module' })
@@ -104,13 +110,28 @@ export function useShorbantorParser(): UseShorbantorParserResult {
     workerRef.current?.postMessage(req)
   }, [])
 
-  const request = useCallback(<T extends WorkerResponse>(build: (requestId: number) => WorkerRequest): Promise<T> => {
-    return new Promise((resolve) => {
-      const requestId = ++requestIdRef.current
-      pendingRequests.current.set(requestId, resolve as (msg: WorkerResponse) => void)
-      send(build(requestId))
-    })
-  }, [send])
+  /**
+   * Resolves with the worker's reply, or with `fallback` if that single request
+   * failed. Requests are never left pending: an unsettled promise here shows up
+   * as a permanently blank pane or a stuck breadcrumb rather than an error.
+   */
+  const request = useCallback(
+    <T extends WorkerResponse, R>(build: (requestId: number) => WorkerRequest, extract: (msg: T) => R, fallback: R): Promise<R> => {
+      return new Promise((resolve) => {
+        const requestId = ++requestIdRef.current
+        pendingRequests.current.set(requestId, (msg) => {
+          if (msg.type === 'REQUEST_FAILED') {
+            setOpError(msg.message)
+            resolve(fallback)
+            return
+          }
+          resolve(extract(msg as T))
+        })
+        send(build(requestId))
+      })
+    },
+    [send],
+  )
 
   const loadFile = useCallback(
     (file: File, mode: ParseMode) => {
@@ -118,6 +139,7 @@ export function useShorbantorParser(): UseShorbantorParserResult {
       setProgress(0)
       setLoadingNodeCount(0)
       setError(null)
+      setOpError(null)
       setStats(null)
       setVisibleCount(0)
       pendingRequests.current.clear()
@@ -132,82 +154,81 @@ export function useShorbantorParser(): UseShorbantorParserResult {
 
   const getVisibleNodes = useCallback(
     (start: number, end: number) =>
-      request<Extract<WorkerResponse, { type: 'VISIBLE_RANGE' }>>((requestId) => ({
-        type: 'GET_VISIBLE_RANGE',
-        requestId,
-        startIndex: start,
-        endIndex: end,
-      })).then((msg) => msg.nodes),
+      request<Extract<WorkerResponse, { type: 'VISIBLE_RANGE' }>, FlatNodeView[]>(
+        (requestId) => ({ type: 'GET_VISIBLE_RANGE', requestId, startIndex: start, endIndex: end }),
+        (msg) => msg.nodes,
+        [],
+      ),
     [request],
   )
 
   const search = useCallback(
     (query: string) =>
-      request<Extract<WorkerResponse, { type: 'SEARCH_RESULT' }>>((requestId) => ({
-        type: 'SET_SEARCH',
-        requestId,
-        query,
-      })).then((msg) => ({ matchCount: msg.matchCount, visibleCount: msg.visibleCount })),
+      request<Extract<WorkerResponse, { type: 'SEARCH_RESULT' }>, { matchCount: number; visibleCount: number }>(
+        (requestId) => ({ type: 'SET_SEARCH', requestId, query }),
+        (msg) => ({ matchCount: msg.matchCount, visibleCount: msg.visibleCount }),
+        { matchCount: 0, visibleCount: 0 },
+      ),
     [request],
   )
 
   const getMatchPosition = useCallback(
     (matchIndex: number) =>
-      request<Extract<WorkerResponse, { type: 'MATCH_POSITION' }>>((requestId) => ({
-        type: 'GET_MATCH_POSITION',
-        requestId,
-        matchIndex,
-      })).then((msg) => msg.position),
+      request<Extract<WorkerResponse, { type: 'MATCH_POSITION' }>, number>(
+        (requestId) => ({ type: 'GET_MATCH_POSITION', requestId, matchIndex }),
+        (msg) => msg.position,
+        -1,
+      ),
     [request],
   )
 
   const getInspectorRows = useCallback(
     (nodeId: number | null) =>
-      request<Extract<WorkerResponse, { type: 'INSPECTOR_ROWS' }>>((requestId) => ({
-        type: 'GET_INSPECTOR_ROWS',
-        requestId,
-        nodeId,
-      })).then((msg) => ({ rows: msg.rows, title: msg.title })),
+      request<Extract<WorkerResponse, { type: 'INSPECTOR_ROWS' }>, { rows: InspectorRow[]; title: string }>(
+        (requestId) => ({ type: 'GET_INSPECTOR_ROWS', requestId, nodeId }),
+        (msg) => ({ rows: msg.rows, title: msg.title }),
+        { rows: [], title: '—' },
+      ),
     [request],
   )
 
   const getAncestorChain = useCallback(
     (nodeId: number | null) =>
-      request<Extract<WorkerResponse, { type: 'ANCESTOR_CHAIN' }>>((requestId) => ({
-        type: 'GET_ANCESTOR_CHAIN',
-        requestId,
-        nodeId,
-      })).then((msg) => msg.crumbs),
+      request<Extract<WorkerResponse, { type: 'ANCESTOR_CHAIN' }>, AncestorCrumb[]>(
+        (requestId) => ({ type: 'GET_ANCESTOR_CHAIN', requestId, nodeId }),
+        (msg) => msg.crumbs,
+        [],
+      ),
     [request],
   )
 
   const getSubtreeText = useCallback(
     (nodeId: number) =>
-      request<Extract<WorkerResponse, { type: 'SUBTREE_TEXT' }>>((requestId) => ({
-        type: 'GET_SUBTREE_TEXT',
-        requestId,
-        nodeId,
-      })).then((msg) => msg.text),
+      request<Extract<WorkerResponse, { type: 'SUBTREE_TEXT' }>, string>(
+        (requestId) => ({ type: 'GET_SUBTREE_TEXT', requestId, nodeId }),
+        (msg) => msg.text,
+        '',
+      ),
     [request],
   )
 
   const getValueText = useCallback(
     (nodeId: number) =>
-      request<Extract<WorkerResponse, { type: 'VALUE_TEXT' }>>((requestId) => ({
-        type: 'GET_VALUE_TEXT',
-        requestId,
-        nodeId,
-      })).then((msg) => msg.text),
+      request<Extract<WorkerResponse, { type: 'VALUE_TEXT' }>, string>(
+        (requestId) => ({ type: 'GET_VALUE_TEXT', requestId, nodeId }),
+        (msg) => msg.text,
+        '',
+      ),
     [request],
   )
 
   const getNodePath = useCallback(
     (nodeId: number) =>
-      request<Extract<WorkerResponse, { type: 'NODE_PATH' }>>((requestId) => ({
-        type: 'GET_NODE_PATH',
-        requestId,
-        nodeId,
-      })).then((msg) => msg.path),
+      request<Extract<WorkerResponse, { type: 'NODE_PATH' }>, string>(
+        (requestId) => ({ type: 'GET_NODE_PATH', requestId, nodeId }),
+        (msg) => msg.path,
+        '',
+      ),
     [request],
   )
 
@@ -216,6 +237,8 @@ export function useShorbantorParser(): UseShorbantorParserResult {
     progress,
     loadingNodeCount,
     error,
+    opError,
+    clearOpError,
     stats,
     visibleCount,
     loadFile,

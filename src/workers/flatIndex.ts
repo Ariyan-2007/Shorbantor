@@ -6,6 +6,19 @@ const NULL_OFFSET = 0xffffffff
 /** Root and its immediate children start expanded; deeper nodes start collapsed. */
 const DEFAULT_EXPANDED_DEPTH = 2
 
+/**
+ * Numeric node-type codes. Hot paths compare these directly instead of going
+ * through NODE_TYPE_NAMES[code] — a string materialization plus string compare
+ * per check, which showed up everywhere in the traversal and search loops.
+ */
+const T_OBJECT = 0
+const T_ARRAY = 1
+const T_XML_TAG = 2
+const T_STRING = 3
+const T_NUMBER = 4
+const T_BOOLEAN = 5
+const T_NULL = 6
+
 export const NODE_TYPE_NAMES: NodeType[] = [
   'object',
   'array',
@@ -17,13 +30,13 @@ export const NODE_TYPE_NAMES: NodeType[] = [
 ]
 
 export const NODE_TYPE_CODES: Record<NodeType, number> = {
-  object: 0,
-  array: 1,
-  xml_tag: 2,
-  string: 3,
-  number: 4,
-  boolean: 5,
-  null: 6,
+  object: T_OBJECT,
+  array: T_ARRAY,
+  xml_tag: T_XML_TAG,
+  string: T_STRING,
+  number: T_NUMBER,
+  boolean: T_BOOLEAN,
+  null: T_NULL,
 }
 
 type TypedArray = Int32Array | Uint32Array | Uint16Array | Uint8Array
@@ -64,6 +77,11 @@ class GrowableArray<T extends TypedArray> {
   }
 }
 
+/** ASCII upper -> lower, used for case-insensitive matching directly on pool bytes. */
+function fold(b: number): number {
+  return b >= 65 && b <= 90 ? b + 32 : b
+}
+
 /** Append-only UTF-8 byte pool backing every key/value/attribute string in the index. */
 class StringPool {
   private bytes: Uint8Array
@@ -85,18 +103,52 @@ class StringPool {
   }
 
   append(str: string): { offset: number; length: number } {
-    const encoded = this.encoder.encode(str)
-    this.ensureCapacity(this.length + encoded.length)
-    this.bytes.set(encoded, this.length)
+    // encodeInto writes straight into the pool when there is room, skipping the
+    // intermediate Uint8Array that encode() allocates for every string.
+    this.ensureCapacity(this.length + str.length * 3)
+    const { written } = this.encoder.encodeInto(str, this.bytes.subarray(this.length))
     const offset = this.length
-    this.length += encoded.length
-    return { offset, length: encoded.length }
+    this.length += written
+    return { offset, length: written }
   }
 
   read(offset: number, length: number): string {
     if (length === 0) return ''
     return this.decoder.decode(this.bytes.subarray(offset, offset + length))
   }
+
+  /**
+   * Case-insensitive substring test run directly against the pooled UTF-8
+   * bytes — no decode, no toLowerCase(), no allocation. Folding is ASCII-only,
+   * which is exact for ASCII needles: every byte of a multi-byte UTF-8
+   * sequence is >= 0x80, so an ASCII needle can never match inside one.
+   * Callers fall back to the decoding path for non-ASCII queries.
+   */
+  includesFolded(offset: number, length: number, needle: Uint8Array): boolean {
+    const m = needle.length
+    if (m === 0) return true
+    if (m > length) return false
+    const bytes = this.bytes
+    const first = needle[0]
+    const end = offset + length - m
+    for (let i = offset; i <= end; i++) {
+      if (fold(bytes[i]) !== first) continue
+      let k = 1
+      while (k < m && fold(bytes[i + k]) === needle[k]) k++
+      if (k === m) return true
+    }
+    return false
+  }
+}
+
+/**
+ * Trims a scratch buffer to its used length. subarray() keeps the whole
+ * oversized backing store alive, which is fine when most of it was used but
+ * wasteful for a narrow search result — so copy out once the slack is large.
+ */
+function trimTo(buf: Uint32Array, used: number): Uint32Array {
+  if (used === buf.length) return buf
+  return used * 2 >= buf.length ? buf.subarray(0, used) : buf.slice(0, used)
 }
 
 function markText(text: string, query: string | null): [string, string, string] {
@@ -163,12 +215,18 @@ export class FlatNodeIndex implements IndexBuilder {
   private topLevelFirstId = NONE
   private topLevelLastId = NONE
   private topLevelCount = 0
+  private maxDepthSeen = 0
 
   private visibleOrder: Uint32Array = new Uint32Array(0)
 
   private activeQuery: string | null = null
   private searchVisibleOrder: Uint32Array = new Uint32Array(0)
-  private searchMatchIds: number[] = []
+  private searchMatchIds: Int32Array = new Int32Array(0)
+  private searchMatchCount = 0
+  /** 1 where the node itself matches the active query — computed once per query and reused by the walk, by getNodeView, and by match navigation. */
+  private selfHit: Uint8Array = new Uint8Array(0)
+  /** visible-row index of each match id, so getMatchPosition is O(1) instead of a scan of the whole filtered order. */
+  private matchPositionById = new Map<number, number>()
 
   nodeCount = 0
   private mode: ParseMode
@@ -221,6 +279,14 @@ export class FlatNodeIndex implements IndexBuilder {
     this.nextSiblingIdArr.push(NONE)
     this.siblingIndexArr.push(this.linkIntoParent(params.parentId, id, params.type))
 
+    // Depth stat counts only nodes that get their own row: text/CDATA leaves
+    // absorbed into an xml_tag's row never deepened the reported tree.
+    const absorbed =
+      params.parentId !== NONE &&
+      this.nodeTypeArr.get(params.parentId) === T_XML_TAG &&
+      params.type !== 'xml_tag'
+    if (!absorbed && params.depth > this.maxDepthSeen) this.maxDepthSeen = params.depth
+
     this.writeString(this.keyOffsetArr, this.keyLengthArr, params.key)
     this.writeString(this.valueOffsetArr, this.valueLengthArr, params.value)
     this.writeString(this.attrOffsetArr, this.attrLengthArr, params.attributes)
@@ -272,21 +338,27 @@ export class FlatNodeIndex implements IndexBuilder {
 
   private isLastChild(id: number): boolean {
     const parentId = this.parentIdArr.get(id)
-    const type = NODE_TYPE_NAMES[this.nodeTypeArr.get(id)]
     if (parentId === NONE) return this.siblingIndexArr.get(id) === this.topLevelCount - 1
-    if (type === 'xml_tag') return this.elementSiblingIndexArr.get(id) === this.elementChildCountArr.get(parentId) - 1
+    if (this.nodeTypeArr.get(id) === T_XML_TAG) {
+      return this.elementSiblingIndexArr.get(id) === this.elementChildCountArr.get(parentId) - 1
+    }
     return this.siblingIndexArr.get(id) === this.childCountArr.get(parentId) - 1
   }
 
   /** Root-first: one entry per ancestor, true if that ancestor has a following sibling (so its guide line must continue). */
   private getRails(id: number): boolean[] {
-    const rails: boolean[] = []
+    const depth = this.depthArr.get(id)
+    if (depth === 0) return []
+    // Filled back-to-front: unshift() on a plain array is O(n) per call, which
+    // made this O(depth^2) for every materialized row.
+    const rails = new Array<boolean>(depth)
     let cur = this.parentIdArr.get(id)
-    while (cur !== NONE) {
-      rails.unshift(!this.isLastChild(cur))
+    let i = depth - 1
+    while (cur !== NONE && i >= 0) {
+      rails[i--] = !this.isLastChild(cur)
       cur = this.parentIdArr.get(cur)
     }
-    return rails
+    return i >= 0 ? rails.slice(i + 1) : rails
   }
 
   // ---- Expansion bitset -------------------------------------------------
@@ -316,14 +388,12 @@ export class FlatNodeIndex implements IndexBuilder {
 
   /** xml_tag counts only its element children (text/CDATA never make a tag "expandable"); object/array count all children. */
   isContainerNode(id: number): boolean {
-    const type = NODE_TYPE_NAMES[this.nodeTypeArr.get(id)]
-    if (type === 'xml_tag') return this.elementChildCountArr.get(id) > 0
+    if (this.nodeTypeArr.get(id) === T_XML_TAG) return this.elementChildCountArr.get(id) > 0
     return this.childCountArr.get(id) > 0
   }
 
   private effectiveChildCount(id: number): number {
-    const type = NODE_TYPE_NAMES[this.nodeTypeArr.get(id)]
-    return type === 'xml_tag' ? this.elementChildCountArr.get(id) : this.childCountArr.get(id)
+    return this.nodeTypeArr.get(id) === T_XML_TAG ? this.elementChildCountArr.get(id) : this.childCountArr.get(id)
   }
 
   toggleExpand(nodeId: number) {
@@ -345,15 +415,32 @@ export class FlatNodeIndex implements IndexBuilder {
     }
   }
 
-  /** Node ids that should appear as their own row under `id` when expanded — text/CDATA leaves under an xml_tag are absorbed into their parent's own row instead. */
-  private childrenToVisit(id: number): number[] {
-    const type = NODE_TYPE_NAMES[this.nodeTypeArr.get(id)]
-    const out: number[] = []
+  // ---- Structural walk helpers ------------------------------------------
+
+  /**
+   * First child of `id` that gets its own row. Text/CDATA leaves under an
+   * xml_tag are absorbed into their parent's row instead of being listed.
+   */
+  private firstRowChild(id: number): number {
     let c = this.firstChildIdArr.get(id)
-    while (c !== NONE) {
-      if (type !== 'xml_tag' || NODE_TYPE_NAMES[this.nodeTypeArr.get(c)] === 'xml_tag') out.push(c)
-      c = this.nextSiblingIdArr.get(c)
-    }
+    if (this.nodeTypeArr.get(id) !== T_XML_TAG) return c
+    while (c !== NONE && this.nodeTypeArr.get(c) !== T_XML_TAG) c = this.nextSiblingIdArr.get(c)
+    return c
+  }
+
+  /** Next sibling of `id` that gets its own row, applying the same xml_tag filter. */
+  private nextRowSibling(id: number): number {
+    const parentId = this.parentIdArr.get(id)
+    let c = this.nextSiblingIdArr.get(id)
+    if (parentId === NONE || this.nodeTypeArr.get(parentId) !== T_XML_TAG) return c
+    while (c !== NONE && this.nodeTypeArr.get(c) !== T_XML_TAG) c = this.nextSiblingIdArr.get(c)
+    return c
+  }
+
+  /** Node ids that should appear as their own row under `id` when expanded. */
+  private childrenToVisit(id: number): number[] {
+    const out: number[] = []
+    for (let c = this.firstRowChild(id); c !== NONE; c = this.nextRowSibling(c)) out.push(c)
     return out
   }
 
@@ -361,14 +448,14 @@ export class FlatNodeIndex implements IndexBuilder {
   private getInlineXmlText(id: number): string | null {
     if (this.elementChildCountArr.get(id) > 0) return null
     if (this.childCountArr.get(id) === 0) return null
-    const parts: string[] = []
+    let out: string | null = null
     let c = this.firstChildIdArr.get(id)
     while (c !== NONE) {
       const v = this.readString(this.valueOffsetArr, this.valueLengthArr, c)
-      if (v) parts.push(v)
+      if (v) out = out === null ? v : out + ' ' + v
       c = this.nextSiblingIdArr.get(c)
     }
-    return parts.length > 0 ? parts.join(' ') : null
+    return out
   }
 
   // ---- Visible order (depth filtering) -----------------------------------
@@ -377,29 +464,34 @@ export class FlatNodeIndex implements IndexBuilder {
    * Recomputed from scratch on every toggle/expand-to-depth rather than
    * patched incrementally: an incrementally-shifted flat list needs an
    * order-statistics structure to stay O(log n), which is overkill here —
-   * a full DFS still runs entirely off the main thread and stays well under
+   * a full walk still runs entirely off the main thread and stays well under
    * a frame for tens of millions of nodes.
+   *
+   * The walk is a pointer-chasing descend/advance/climb loop rather than an
+   * explicit stack of child arrays: it allocates nothing per node (the old
+   * form built a fresh JS array of children for every container it entered)
+   * and writes straight into one exactly-sized Uint32Array instead of filling
+   * a GrowableArray and then copying it out.
    */
   rebuildVisibleOrder() {
-    const out = new GrowableArray(Uint32Array, Math.max(1024, this.nodeCount))
-    const stack: number[] = []
-    const pushReversed = (ids: number[]) => {
-      for (let i = ids.length - 1; i >= 0; i--) stack.push(ids[i])
-    }
+    const out = new Uint32Array(this.nodeCount)
+    let k = 0
+    let id = this.topLevelFirstId
 
-    pushReversed(this.getTopLevelIds())
-
-    while (stack.length > 0) {
-      const id = stack.pop() as number
-      out.push(id)
-      if (this.isContainerNode(id) && this.isExpanded(id)) {
-        pushReversed(this.childrenToVisit(id))
+    while (id !== NONE) {
+      out[k++] = id
+      let next = NONE
+      if (this.isContainerNode(id) && this.isExpanded(id)) next = this.firstRowChild(id)
+      if (next === NONE) {
+        for (let cur = id; cur !== NONE; cur = this.parentIdArr.get(cur)) {
+          next = this.nextRowSibling(cur)
+          if (next !== NONE) break
+        }
       }
+      id = next
     }
 
-    const result = new Uint32Array(out.length)
-    for (let i = 0; i < out.length; i++) result[i] = out.get(i)
-    this.visibleOrder = result
+    this.visibleOrder = trimTo(out, k)
   }
 
   getVisibleCount(): number {
@@ -420,15 +512,9 @@ export class FlatNodeIndex implements IndexBuilder {
     return this.topLevelFirstId === NONE ? null : this.topLevelFirstId
   }
 
+  /** Depth is recorded as each node is appended, so the deepest level is already known — no traversal needed. */
   computeMaxDepth(): number {
-    let max = 0
-    const stack: [number, number][] = this.getTopLevelIds().map((id) => [id, 1] as [number, number])
-    while (stack.length > 0) {
-      const [id, depth] = stack.pop() as [number, number]
-      if (depth > max) max = depth
-      for (const c of this.childrenToVisit(id)) stack.push([c, depth + 1])
-    }
-    return max
+    return this.nodeCount === 0 ? 0 : this.maxDepthSeen + 1
   }
 
   getVisibleSlice(start: number, end: number): FlatNodeView[] {
@@ -444,23 +530,41 @@ export class FlatNodeIndex implements IndexBuilder {
 
   // ---- Search -------------------------------------------------------------
 
+  /** Encoded, ASCII-folded needle for the byte-level path; null when the query has non-ASCII characters. */
+  private queryBytes: Uint8Array | null = null
+
+  private poolHit(offsetArr: GrowableArray<Uint32Array>, lengthArr: GrowableArray<Uint32Array>, id: number, q: string): boolean {
+    const offset = offsetArr.get(id)
+    if (offset === NULL_OFFSET) return false
+    const len = lengthArr.get(id)
+    if (len === 0) return false
+    if (this.queryBytes) return this.strings.includesFolded(offset, len, this.queryBytes)
+    return this.strings.read(offset, len).toLowerCase().includes(q)
+  }
+
   private hitSelf(id: number, q: string): boolean {
-    const type = NODE_TYPE_NAMES[this.nodeTypeArr.get(id)]
-    const key = this.readKey(id)
-    if (key && key.toLowerCase().includes(q)) return true
+    if (this.poolHit(this.keyOffsetArr, this.keyLengthArr, id, q)) return true
+
     const parentId = this.parentIdArr.get(id)
-    if (parentId !== NONE && NODE_TYPE_NAMES[this.nodeTypeArr.get(parentId)] === 'array') {
+    if (parentId !== NONE && this.nodeTypeArr.get(parentId) === T_ARRAY) {
       if (String(this.siblingIndexArr.get(id)).includes(q)) return true
     }
-    if (type === 'xml_tag') {
-      const attrs = this.readString(this.attrOffsetArr, this.attrLengthArr, id)
-      if (attrs && attrs.toLowerCase().includes(q)) return true
-      const inline = this.getInlineXmlText(id)
-      return !!inline && inline.toLowerCase().includes(q)
+
+    const type = this.nodeTypeArr.get(id)
+    if (type === T_XML_TAG) {
+      if (this.poolHit(this.attrOffsetArr, this.attrLengthArr, id, q)) return true
+      // Absorbed text children render on this tag's own row, so they count as
+      // this node's own content. Tested per child against the pool rather than
+      // joining them into a throwaway string first.
+      if (this.elementChildCountArr.get(id) > 0) return false
+      for (let c = this.firstChildIdArr.get(id); c !== NONE; c = this.nextSiblingIdArr.get(c)) {
+        if (this.poolHit(this.valueOffsetArr, this.valueLengthArr, c, q)) return true
+      }
+      return false
     }
-    if (type !== 'object' && type !== 'array') {
-      const value = this.readString(this.valueOffsetArr, this.valueLengthArr, id)
-      if (value && value.toLowerCase().includes(q)) return true
+
+    if (type !== T_OBJECT && type !== T_ARRAY) {
+      if (this.poolHit(this.valueOffsetArr, this.valueLengthArr, id, q)) return true
     }
     return false
   }
@@ -469,50 +573,89 @@ export class FlatNodeIndex implements IndexBuilder {
     const q = query.trim().toLowerCase()
     if (!q) {
       this.activeQuery = null
+      this.queryBytes = null
       this.searchVisibleOrder = new Uint32Array(0)
-      this.searchMatchIds = []
+      this.searchMatchIds = new Int32Array(0)
+      this.searchMatchCount = 0
+      this.selfHit = new Uint8Array(0)
+      this.matchPositionById.clear()
       return { matchCount: 0, visibleCount: this.visibleOrder.length }
     }
     this.activeQuery = q
+    // eslint-disable-next-line no-control-regex
+    this.queryBytes = /^[\x00-\x7f]*$/.test(q) ? new TextEncoder().encode(q) : null
 
+    // One pass to score every node, then a reverse pass to propagate hits up to
+    // ancestors. Children always have a higher id than their parent, so a single
+    // descending sweep is enough to lift every hit to the root.
+    const selfHit = new Uint8Array(this.nodeCount)
     const anyHit = new Uint8Array(this.nodeCount)
-    for (let id = 0; id < this.nodeCount; id++) anyHit[id] = this.hitSelf(id, q) ? 1 : 0
+    let matchTotal = 0
+    for (let id = 0; id < this.nodeCount; id++) {
+      if (this.hitSelf(id, q)) {
+        selfHit[id] = 1
+        anyHit[id] = 1
+        matchTotal++
+      }
+    }
     for (let id = this.nodeCount - 1; id >= 0; id--) {
       if (anyHit[id]) {
         const p = this.parentIdArr.get(id)
         if (p !== NONE) anyHit[p] = 1
       }
     }
+    this.selfHit = selfHit
 
-    const out = new GrowableArray(Uint32Array, Math.max(1024, this.nodeCount))
-    const matches: number[] = []
-    const stack: number[] = []
-    const pushReversed = (ids: number[]) => {
-      for (let i = ids.length - 1; i >= 0; i--) if (anyHit[ids[i]]) stack.push(ids[i])
+    const out = new Uint32Array(this.nodeCount)
+    const matches = new Int32Array(matchTotal)
+    this.matchPositionById.clear()
+    let k = 0
+    let m = 0
+
+    // Same allocation-free descend/advance/climb walk as rebuildVisibleOrder,
+    // additionally skipping any subtree that contains no hit at all.
+    const firstHitChild = (id: number): number => {
+      let c = this.firstRowChild(id)
+      while (c !== NONE && !anyHit[c]) c = this.nextRowSibling(c)
+      return c
     }
-    pushReversed(this.getTopLevelIds())
-
-    while (stack.length > 0) {
-      const id = stack.pop() as number
-      out.push(id)
-      if (this.hitSelf(id, q)) matches.push(id)
-      if (this.isContainerNode(id)) pushReversed(this.childrenToVisit(id))
+    const nextHitSibling = (id: number): number => {
+      let c = this.nextRowSibling(id)
+      while (c !== NONE && !anyHit[c]) c = this.nextRowSibling(c)
+      return c
     }
 
-    const result = new Uint32Array(out.length)
-    for (let i = 0; i < out.length; i++) result[i] = out.get(i)
-    this.searchVisibleOrder = result
-    this.searchMatchIds = matches
-    return { matchCount: matches.length, visibleCount: result.length }
+    let id = this.topLevelFirstId
+    while (id !== NONE && !anyHit[id]) id = this.nextSiblingIdArr.get(id)
+
+    while (id !== NONE) {
+      if (selfHit[id]) {
+        matches[m++] = id
+        this.matchPositionById.set(id, k)
+      }
+      out[k++] = id
+
+      let next = this.isContainerNode(id) ? firstHitChild(id) : NONE
+      if (next === NONE) {
+        for (let cur = id; cur !== NONE; cur = this.parentIdArr.get(cur)) {
+          next = nextHitSibling(cur)
+          if (next !== NONE) break
+        }
+      }
+      id = next
+    }
+
+    this.searchVisibleOrder = trimTo(out, k)
+    this.searchMatchIds = m === matches.length ? matches : matches.slice(0, m)
+    this.searchMatchCount = m
+    return { matchCount: m, visibleCount: k }
   }
 
+  /** O(1): positions were recorded during the filtered walk rather than re-scanned per jump. */
   getMatchPosition(matchIndex: number): number {
-    if (matchIndex < 0 || matchIndex >= this.searchMatchIds.length) return -1
-    const id = this.searchMatchIds[matchIndex]
-    for (let i = 0; i < this.searchVisibleOrder.length; i++) {
-      if (this.searchVisibleOrder[i] === id) return i
-    }
-    return -1
+    if (matchIndex < 0 || matchIndex >= this.searchMatchCount) return -1
+    const pos = this.matchPositionById.get(this.searchMatchIds[matchIndex])
+    return pos === undefined ? -1 : pos
   }
 
   // ---- Node materialization -----------------------------------------------
@@ -567,23 +710,23 @@ export class FlatNodeIndex implements IndexBuilder {
     const parentId = this.parentIdArr.get(id)
     if (this.mode === 'xml') return { text: this.readKey(id) ?? 'node', token: 'tag' }
     if (parentId === NONE) return { text: 'root', token: 'key' }
-    const parentType = NODE_TYPE_NAMES[this.nodeTypeArr.get(parentId)]
-    if (parentType === 'array') return { text: `[${this.siblingIndexArr.get(id)}]`, token: 'idx' }
+    if (this.nodeTypeArr.get(parentId) === T_ARRAY) return { text: `[${this.siblingIndexArr.get(id)}]`, token: 'idx' }
     return { text: this.readKey(id) ?? '', token: 'key' }
   }
 
   getNodeView(id: number): FlatNodeView {
-    const type = NODE_TYPE_NAMES[this.nodeTypeArr.get(id)]
+    const typeCode = this.nodeTypeArr.get(id)
+    const type = NODE_TYPE_NAMES[typeCode]
     const isContainer = this.isContainerNode(id)
     const isExpanded = this.activeQuery ? isContainer : this.isExpanded(id)
 
     let valueText: string
     let valueColorToken: ColorToken
-    if (type === 'string' || type === 'number' || type === 'boolean' || type === 'null') {
+    if (typeCode === T_STRING || typeCode === T_NUMBER || typeCode === T_BOOLEAN || typeCode === T_NULL) {
       const d = primDisplay(type, this.readString(this.valueOffsetArr, this.valueLengthArr, id))
       valueText = d.text
       valueColorToken = d.token
-    } else if (type === 'xml_tag') {
+    } else if (typeCode === T_XML_TAG) {
       valueText = this.getInlineXmlText(id) ?? ''
       valueColorToken = 'str'
     } else if (isExpanded) {
@@ -598,7 +741,7 @@ export class FlatNodeIndex implements IndexBuilder {
     const [keyPre, keyMid, keyPost] = markText(key.text, this.activeQuery)
     const [valuePre, valueMid, valuePost] = markText(valueText, this.activeQuery)
 
-    const markerColorToken: ColorToken = type === 'xml_tag' ? 'accent' : valueColorToken
+    const markerColorToken: ColorToken = typeCode === T_XML_TAG ? 'accent' : valueColorToken
 
     return {
       id,
@@ -623,7 +766,9 @@ export class FlatNodeIndex implements IndexBuilder {
       path: this.mode === 'xml' ? this.computeXmlPath(id) : this.computeJsonPath(id),
       rails: this.getRails(id),
       elbowExtendsDown: this.parentIdArr.get(id) !== NONE && !this.isLastChild(id),
-      isSearchMatch: this.activeQuery !== null && this.hitSelf(id, this.activeQuery),
+      // Reuses the bitset built by setSearchQuery instead of re-running the
+      // whole match test for every row that scrolls into view.
+      isSearchMatch: this.activeQuery !== null && id < this.selfHit.length && this.selfHit[id] === 1,
     }
   }
 
@@ -633,27 +778,28 @@ export class FlatNodeIndex implements IndexBuilder {
     while (cur !== NONE) {
       const parentId = this.parentIdArr.get(cur)
       if (parentId === NONE) break
-      const parentType = NODE_TYPE_NAMES[this.nodeTypeArr.get(parentId)]
-      if (parentType === 'array') {
-        segments.unshift(`[${this.siblingIndexArr.get(cur)}]`)
+      if (this.nodeTypeArr.get(parentId) === T_ARRAY) {
+        segments.push(`[${this.siblingIndexArr.get(cur)}]`)
       } else {
-        segments.unshift(`.${this.readKey(cur) ?? ''}`)
+        segments.push(`.${this.readKey(cur) ?? ''}`)
       }
       cur = parentId
     }
+    segments.reverse()
     return '$' + segments.join('')
   }
 
   private computeXmlPath(id: number): string {
     const segments: string[] = []
     let cur = id
-    const isTextLeaf = NODE_TYPE_NAMES[this.nodeTypeArr.get(id)] !== 'xml_tag'
+    const isTextLeaf = this.nodeTypeArr.get(id) !== T_XML_TAG
     while (cur !== NONE) {
-      if (NODE_TYPE_NAMES[this.nodeTypeArr.get(cur)] === 'xml_tag') {
-        segments.unshift(`${this.readKey(cur) ?? 'node'}[${this.siblingIndexArr.get(cur)}]`)
+      if (this.nodeTypeArr.get(cur) === T_XML_TAG) {
+        segments.push(`${this.readKey(cur) ?? 'node'}[${this.siblingIndexArr.get(cur)}]`)
       }
       cur = this.parentIdArr.get(cur)
     }
+    segments.reverse()
     return '/' + segments.join('/') + (isTextLeaf ? '/text()' : '')
   }
 
@@ -668,18 +814,18 @@ export class FlatNodeIndex implements IndexBuilder {
     while (cur !== NONE) {
       const parentId = this.parentIdArr.get(cur)
       if (parentId === NONE) {
-        chain.unshift({ id: cur, label: 'root' })
+        chain.push({ id: cur, label: 'root' })
       } else if (this.mode === 'xml') {
-        chain.unshift({ id: cur, label: this.readKey(cur) ?? 'node' })
+        chain.push({ id: cur, label: this.readKey(cur) ?? 'node' })
       } else {
-        const parentType = NODE_TYPE_NAMES[this.nodeTypeArr.get(parentId)]
-        chain.unshift({
+        chain.push({
           id: cur,
-          label: parentType === 'array' ? `[${this.siblingIndexArr.get(cur)}]` : (this.readKey(cur) ?? ''),
+          label: this.nodeTypeArr.get(parentId) === T_ARRAY ? `[${this.siblingIndexArr.get(cur)}]` : (this.readKey(cur) ?? ''),
         })
       }
       cur = parentId
     }
+    chain.reverse()
     return chain
   }
 
@@ -743,63 +889,226 @@ export class FlatNodeIndex implements IndexBuilder {
   }
 
   getValueText(nodeId: number): string {
-    const type = NODE_TYPE_NAMES[this.nodeTypeArr.get(nodeId)]
-    if (type === 'xml_tag') return this.getInlineXmlText(nodeId) ?? ''
-    if (type === 'object' || type === 'array') return this.getSubtreeText(nodeId)
+    const type = this.nodeTypeArr.get(nodeId)
+    if (type === T_XML_TAG) return this.getInlineXmlText(nodeId) ?? ''
+    if (type === T_OBJECT || type === T_ARRAY) return this.getSubtreeText(nodeId)
     return this.readString(this.valueOffsetArr, this.valueLengthArr, nodeId) ?? ''
   }
 
+  /**
+   * Depth past which the native JSON.stringify path is unsafe. JSON.stringify
+   * recurses internally, so even an iteratively-built plain value overflows the
+   * stack on a deep enough document; engines differ on where, and Safari's
+   * limit is the lowest, so this stays far below every observed threshold.
+   */
+  private static readonly SAFE_NATIVE_DEPTH = 1000
+
   getSubtreeText(nodeId: number): string {
-    return this.mode === 'xml' ? this.serializeXml(nodeId, 0) : JSON.stringify(this.toPlainValue(nodeId), null, 2)
+    if (this.mode === 'xml') return this.serializeXml(nodeId)
+    const subtreeDepth = this.maxDepthSeen - this.depthArr.get(nodeId)
+    return subtreeDepth < FlatNodeIndex.SAFE_NATIVE_DEPTH
+      ? JSON.stringify(this.toPlainValue(nodeId), null, 2)
+      : this.serializeJson(nodeId)
   }
 
-  private toPlainValue(nodeId: number): unknown {
-    const type = NODE_TYPE_NAMES[this.nodeTypeArr.get(nodeId)]
-    if (type === 'object') {
-      const obj: Record<string, unknown> = {}
-      let c = this.firstChildIdArr.get(nodeId)
-      while (c !== NONE) {
-        obj[this.readKey(c) ?? ''] = this.toPlainValue(c)
-        c = this.nextSiblingIdArr.get(c)
-      }
-      return obj
+  private primitiveJson(id: number): string {
+    const type = this.nodeTypeArr.get(id)
+    const raw = this.readString(this.valueOffsetArr, this.valueLengthArr, id)
+    if (type === T_NUMBER) return raw === null ? 'null' : JSON.stringify(Number(raw))
+    if (type === T_BOOLEAN) return raw === 'true' ? 'true' : 'false'
+    if (type === T_NULL) return 'null'
+    return JSON.stringify(raw)
+  }
+
+  /**
+   * Fully iterative JSON writer used only past SAFE_NATIVE_DEPTH. Slower than
+   * native stringify, but it is the difference between a copy that works and a
+   * worker that dies with a stack overflow. Output matches the native path.
+   */
+  private serializeJson(nodeId: number): string {
+    const parts: string[] = []
+    const pads: string[] = ['']
+    const padFor = (n: number) => {
+      while (pads.length <= n) pads.push(pads[pads.length - 1] + '  ')
+      return pads[n]
     }
-    if (type === 'array') {
-      const arr: unknown[] = []
-      let c = this.firstChildIdArr.get(nodeId)
-      while (c !== NONE) {
-        arr.push(this.toPlainValue(c))
-        c = this.nextSiblingIdArr.get(c)
+
+    const ids: number[] = [nodeId]
+    const cursors: number[] = [-2]
+    const indents: number[] = [0]
+
+    while (ids.length > 0) {
+      const top = ids.length - 1
+      const id = ids[top]
+      const type = this.nodeTypeArr.get(id)
+      const indent = indents[top]
+
+      if (type !== T_OBJECT && type !== T_ARRAY) {
+        parts.push(this.primitiveJson(id))
+        ids.pop()
+        cursors.pop()
+        indents.pop()
+        continue
       }
-      return arr
+
+      const isObject = type === T_OBJECT
+      const descend = (child: number) => {
+        parts.push(padFor(indent + 1))
+        if (isObject) parts.push(JSON.stringify(this.readKey(child) ?? '') + ': ')
+        cursors[top] = child
+        ids.push(child)
+        cursors.push(-2)
+        indents.push(indent + 1)
+      }
+
+      if (cursors[top] === -2) {
+        const first = this.firstChildIdArr.get(id)
+        if (first === NONE) {
+          parts.push(isObject ? '{}' : '[]')
+          ids.pop()
+          cursors.pop()
+          indents.pop()
+          continue
+        }
+        parts.push(isObject ? '{\n' : '[\n')
+        descend(first)
+        continue
+      }
+
+      const next = this.nextSiblingIdArr.get(cursors[top])
+      if (next === NONE) {
+        parts.push('\n' + padFor(indent) + (isObject ? '}' : ']'))
+        ids.pop()
+        cursors.pop()
+        indents.pop()
+        continue
+      }
+      parts.push(',\n')
+      descend(next)
     }
-    const raw = this.readString(this.valueOffsetArr, this.valueLengthArr, nodeId)
-    if (type === 'number') return raw === null ? null : Number(raw)
-    if (type === 'boolean') return raw === 'true'
-    if (type === 'null') return null
+
+    return parts.join('')
+  }
+
+  private leafValue(id: number): unknown {
+    const raw = this.readString(this.valueOffsetArr, this.valueLengthArr, id)
+    const type = this.nodeTypeArr.get(id)
+    if (type === T_NUMBER) return raw === null ? null : Number(raw)
+    if (type === T_BOOLEAN) return raw === 'true'
+    if (type === T_NULL) return null
     return raw
   }
 
-  private serializeXml(nodeId: number, indent: number): string {
-    const pad = '  '.repeat(indent)
-    const type = NODE_TYPE_NAMES[this.nodeTypeArr.get(nodeId)]
-    if (type !== 'xml_tag') {
-      return pad + (this.readString(this.valueOffsetArr, this.valueLengthArr, nodeId) ?? '')
-    }
-    const name = this.readKey(nodeId) ?? 'node'
-    const attrs = this.readString(this.attrOffsetArr, this.attrLengthArr, nodeId)
-    const attrStr = attrs ? ` ${attrs}` : ''
-    const elementChildren = this.childrenToVisit(nodeId)
+  /**
+   * Rebuilds a plain JS mirror of a subtree for JSON.stringify. Kept iterative:
+   * the recursive form recursed once per node, so copying a deeply nested
+   * document overflowed the call stack and took the worker down with it. The
+   * explicit stacks live on the heap, so depth is bounded by memory instead.
+   */
+  private toPlainValue(nodeId: number): unknown {
+    const rootType = this.nodeTypeArr.get(nodeId)
+    if (rootType !== T_OBJECT && rootType !== T_ARRAY) return this.leafValue(nodeId)
 
-    if (elementChildren.length === 0) {
-      const inline = this.getInlineXmlText(nodeId)
-      if (inline === null) return `${pad}<${name}${attrStr} />`
-      return `${pad}<${name}${attrStr}>${inline}</${name}>`
+    const root: Record<string, unknown> | unknown[] = rootType === T_OBJECT ? {} : []
+    // Parallel stacks (node id / built container / next unvisited child).
+    const nodes: number[] = [nodeId]
+    const vals: (Record<string, unknown> | unknown[])[] = [root]
+    const cursors: number[] = [this.firstChildIdArr.get(nodeId)]
+
+    while (nodes.length > 0) {
+      const top = nodes.length - 1
+      const childId = cursors[top]
+      if (childId === NONE) {
+        nodes.pop()
+        vals.pop()
+        cursors.pop()
+        continue
+      }
+      cursors[top] = this.nextSiblingIdArr.get(childId)
+
+      const parentVal = vals[top]
+      const parentIsObject = this.nodeTypeArr.get(nodes[top]) === T_OBJECT
+      const childType = this.nodeTypeArr.get(childId)
+      const childIsContainer = childType === T_OBJECT || childType === T_ARRAY
+      const childVal = childIsContainer ? (childType === T_OBJECT ? {} : []) : this.leafValue(childId)
+
+      if (parentIsObject) (parentVal as Record<string, unknown>)[this.readKey(childId) ?? ''] = childVal
+      else (parentVal as unknown[]).push(childVal)
+
+      if (childIsContainer) {
+        nodes.push(childId)
+        vals.push(childVal as Record<string, unknown> | unknown[])
+        cursors.push(this.firstChildIdArr.get(childId))
+      }
+    }
+    return root
+  }
+
+  /** Iterative for the same reason as toPlainValue — deep XML must not overflow the stack. */
+  private serializeXml(nodeId: number): string {
+    const parts: string[] = []
+    // Indent strings are reused rather than rebuilt with repeat() per node.
+    const pads: string[] = ['']
+    const padFor = (n: number) => {
+      while (pads.length <= n) pads.push(pads[pads.length - 1] + '  ')
+      return pads[n]
     }
 
-    const lines = [`${pad}<${name}${attrStr}>`]
-    for (const c of elementChildren) lines.push(this.serializeXml(c, indent + 1))
-    lines.push(`${pad}</${name}>`)
-    return lines.join('\n')
+    const ids: number[] = [nodeId]
+    const cursors: number[] = [-2]
+    const indents: number[] = [0]
+
+    while (ids.length > 0) {
+      const top = ids.length - 1
+      const id = ids[top]
+      const indent = indents[top]
+      const pad = padFor(indent)
+
+      if (this.nodeTypeArr.get(id) !== T_XML_TAG) {
+        parts.push(pad + (this.readString(this.valueOffsetArr, this.valueLengthArr, id) ?? ''))
+        ids.pop()
+        cursors.pop()
+        indents.pop()
+        continue
+      }
+
+      const name = this.readKey(id) ?? 'node'
+
+      if (cursors[top] === -2) {
+        const attrs = this.readString(this.attrOffsetArr, this.attrLengthArr, id)
+        const attrStr = attrs ? ` ${attrs}` : ''
+        const firstChild = this.firstRowChild(id)
+        if (firstChild === NONE) {
+          const inline = this.getInlineXmlText(id)
+          parts.push(inline === null ? `${pad}<${name}${attrStr} />` : `${pad}<${name}${attrStr}>${inline}</${name}>`)
+          ids.pop()
+          cursors.pop()
+          indents.pop()
+          continue
+        }
+        parts.push(`${pad}<${name}${attrStr}>\n`)
+        cursors[top] = firstChild
+        ids.push(firstChild)
+        cursors.push(-2)
+        indents.push(indent + 1)
+        continue
+      }
+
+      const nextChild = this.nextRowSibling(cursors[top])
+      if (nextChild === NONE) {
+        parts.push(`\n${pad}</${name}>`)
+        ids.pop()
+        cursors.pop()
+        indents.pop()
+        continue
+      }
+      parts.push('\n')
+      cursors[top] = nextChild
+      ids.push(nextChild)
+      cursors.push(-2)
+      indents.push(indent + 1)
+    }
+
+    return parts.join('')
   }
 }

@@ -311,7 +311,16 @@ export default function App() {
       />
 
       <main style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
-        {paneOpen && <RawInputPane mode={mode} value={rawText} onChange={setRawText} onLoadText={handleLoadText} onCopy={copy} />}
+        {paneOpen && (
+          <RawInputPane
+            mode={mode}
+            value={rawText}
+            onChange={setRawText}
+            onLoadText={handleLoadText}
+            onCopy={copy}
+            parseError={status === 'error' ? error : null}
+          />
+        )}
 
         <section style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minWidth: 0, background: 'var(--app-surface)' }}>
           <div style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>

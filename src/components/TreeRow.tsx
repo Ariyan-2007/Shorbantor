@@ -1,4 +1,4 @@
-import { type CSSProperties, type MouseEvent } from 'react'
+import { type CSSProperties, type MouseEvent, memo, useMemo } from 'react'
 import { TOKEN_COLOR } from '../lib/colorTokens'
 import type { FlatNodeView } from '../types/schema'
 import { IconChevron } from './icons'
@@ -18,7 +18,8 @@ function parseAttrPairs(attrs: string): { name: string; value: string }[] {
 
 interface TreeRowProps {
   node: FlatNodeView
-  style: CSSProperties
+  /** Vertical offset in px. Passed as a number rather than a style object so memo() can compare it. */
+  top: number
   isSelected: boolean
   isHovered: boolean
   onToggle: (nodeId: number) => void
@@ -29,9 +30,14 @@ interface TreeRowProps {
   onCopyValue: (node: FlatNodeView) => void
 }
 
-export default function TreeRow({
+/**
+ * memo()'d because the viewer re-renders on every cache fill and every scroll
+ * tick: without it each of those repainted all ~50 mounted rows, including
+ * re-running the attribute regex for each one.
+ */
+function TreeRow({
   node,
-  style,
+  top,
   isSelected,
   isHovered,
   onToggle,
@@ -41,6 +47,12 @@ export default function TreeRow({
   onCopySubtree,
   onCopyValue,
 }: TreeRowProps) {
+  const style: CSSProperties = useMemo(
+    () => ({ position: 'absolute', top: 0, left: 0, width: '100%', transform: `translateY(${top}px)` }),
+    [top],
+  )
+  const attrPairs = useMemo(() => (node.attributes ? parseAttrPairs(node.attributes) : null), [node.attributes])
+
   const glyph =
     node.type === 'array' ? (node.isExpanded ? '[' : '[ ]') : node.type === 'object' ? (node.isExpanded ? '{' : '{ }') : node.isExpanded ? '<' : '< >'
 
@@ -128,9 +140,9 @@ export default function TreeRow({
         {node.keyPost}
       </span>
 
-      {node.attributes && (
+      {attrPairs && (
         <span style={{ display: 'flex', gap: 8, flex: '0 0 auto' }}>
-          {parseAttrPairs(node.attributes).map((a, i) => (
+          {attrPairs.map((a, i) => (
             <span key={i} style={{ fontFamily: 'var(--app-mono)', fontSize: FONT_SIZE }}>
               <span style={{ color: 'var(--sx-attr)' }}>{a.name}</span>
               <span style={{ color: 'var(--sx-punct)' }}>=</span>
@@ -193,6 +205,8 @@ export default function TreeRow({
     </div>
   )
 }
+
+export default memo(TreeRow)
 
 function ActButton({ label, title, onClick }: { label: string; title: string; onClick: (e: MouseEvent) => void }) {
   return (

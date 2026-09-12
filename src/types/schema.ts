@@ -104,4 +104,6 @@ export type WorkerResponse =
   | { type: 'SUBTREE_TEXT'; requestId: number; text: string }
   | { type: 'VALUE_TEXT'; requestId: number; text: string }
   | { type: 'NODE_PATH'; requestId: number; path: string }
+  /** One request failed but the worker and the loaded document are still usable. */
+  | { type: 'REQUEST_FAILED'; requestId: number; message: string }
   | { type: 'ERROR'; message: string }

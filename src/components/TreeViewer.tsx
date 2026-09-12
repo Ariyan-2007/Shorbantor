@@ -4,6 +4,16 @@ import type { FlatNodeView } from '../types/schema'
 import { IconEmpty } from './icons'
 import TreeRow, { ROW_HEIGHT } from './TreeRow'
 
+/**
+ * Rows fetched either side of the viewport so scrolling stays a little ahead of
+ * the worker. Kept small deliberately: a large margin multiplies the rows
+ * materialized per scroll tick, which cost more than the placeholder flicker it
+ * was meant to hide (the virtualizer's own overscan already covers the edges).
+ */
+const FETCH_MARGIN = 16
+/** Hard ceiling on retained rows — a few screens' worth, not the whole document. */
+const MAX_CACHED_ROWS = 600
+
 interface TreeViewerProps {
   visibleCount: number
   getVisibleNodes: (start: number, end: number) => Promise<FlatNodeView[]>
@@ -39,8 +49,15 @@ export default function TreeViewer({
   jumpToIndex,
 }: TreeViewerProps) {
   const parentRef = useRef<HTMLDivElement>(null)
-  const [cache, setCache] = useState<Map<number, FlatNodeView>>(new Map())
+  // Rows live in a mutable ref, not in state. The previous version copied the
+  // whole Map on every fetch (`new Map(prev)`) and never evicted, so scrolling
+  // a large document was O(rows seen) work per frame against a Map that grew
+  // without bound — the dominant source of the viewer's memory growth. A
+  // version counter drives re-render instead of a new Map identity.
+  const cacheRef = useRef(new Map<number, FlatNodeView>())
+  const [, bumpVersion] = useState(0)
   const fetchTokenRef = useRef(0)
+  const generationRef = useRef(0)
 
   const virtualizer = useVirtualizer({
     count: visibleCount,
@@ -57,19 +74,47 @@ export default function TreeViewer({
   // or search changes what's expanded/filtered, so previously cached rows
   // can no longer be trusted once the total changes.
   useEffect(() => {
-    setCache(new Map())
+    cacheRef.current.clear()
+    generationRef.current++
+    bumpVersion((v) => v + 1)
   }, [visibleCount])
 
   useEffect(() => {
     if (rangeEnd <= rangeStart) return
+    const cache = cacheRef.current
+    const from = Math.max(0, rangeStart - FETCH_MARGIN)
+    const to = Math.min(visibleCount, rangeEnd + FETCH_MARGIN)
+
+    // Ask only for the span that is actually missing. Materializing a row is
+    // not free on the worker side (it builds the node's path and guide rails)
+    // and every row also has to be structured-cloned across the boundary, so
+    // refetching rows already held turns each scroll tick into avoidable work.
+    // Nudging the scrollbar usually leaves nothing to fetch at all.
+    let missFrom = -1
+    let missTo = -1
+    for (let i = from; i < to; i++) {
+      if (cache.has(i)) continue
+      if (missFrom < 0) missFrom = i
+      missTo = i + 1
+    }
+    if (missFrom < 0) return
+
     const token = ++fetchTokenRef.current
-    getVisibleNodes(rangeStart, rangeEnd).then((nodes) => {
-      if (token !== fetchTokenRef.current) return
-      setCache((prev) => {
-        const next = new Map(prev)
-        nodes.forEach((node, i) => next.set(rangeStart + i, node))
-        return next
-      })
+    const generation = generationRef.current
+    getVisibleNodes(missFrom, missTo).then((nodes) => {
+      if (token !== fetchTokenRef.current || generation !== generationRef.current) return
+      const live = cacheRef.current
+      for (let i = 0; i < nodes.length; i++) live.set(missFrom + i, nodes[i])
+      // Keep the cache bounded no matter how far the document is scrolled;
+      // rows outside the retained window are cheap to fetch again.
+      if (live.size > MAX_CACHED_ROWS) {
+        const keepFrom = from - MAX_CACHED_ROWS
+        const keepTo = to + MAX_CACHED_ROWS
+        for (const index of live.keys()) {
+          if (index < keepFrom || index > keepTo) live.delete(index)
+        }
+      }
+      bumpVersion((v) => v + 1)
     })
   }, [rangeStart, rangeEnd, getVisibleNodes, visibleCount])
 
@@ -97,15 +142,15 @@ export default function TreeViewer({
     <div id="sb-tree" ref={parentRef} style={{ flex: '1 1 auto', overflow: 'auto', padding: '8px 0 40px', minWidth: 0 }}>
       <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
         {virtualItems.map((vi) => {
-          const style: CSSProperties = {
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            width: '100%',
-            transform: `translateY(${vi.start}px)`,
-          }
-          const node = cache.get(vi.index)
+          const node = cacheRef.current.get(vi.index)
           if (!node) {
+            const style: CSSProperties = {
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: '100%',
+              transform: `translateY(${vi.start}px)`,
+            }
             return (
               <div
                 key={vi.key}
@@ -118,7 +163,7 @@ export default function TreeViewer({
             <TreeRow
               key={vi.key}
               node={node}
-              style={style}
+              top={vi.start}
               isSelected={node.id === selectedNodeId}
               isHovered={!!hoveredPath && node.path.startsWith(hoveredPath) && node.path !== hoveredPath}
               onToggle={onToggle}
