@@ -1,8 +1,8 @@
-import { type ChangeEvent, type DragEvent, type UIEvent, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
+import { type ChangeEvent, type DragEvent, type KeyboardEvent, type UIEvent, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
 import { minifyText, prettyPrint } from '../lib/format'
 import { highlightRaw } from '../lib/highlight'
 import type { ParseMode } from '../types/schema'
-import { IconCollapse, IconCopy, IconExpand } from './icons'
+import { IconChevronDown, IconChevronUp, IconCollapse, IconCopy, IconExpand, IconSearch } from './icons'
 
 /**
  * Above this, the syntax-highlight backdrop is dropped and the textarea renders
@@ -30,6 +30,8 @@ interface ErrorInfo {
 }
 
 interface RawInputPaneProps {
+  /** Whether the "Show input" sidebar is toggled on. The pane stays mounted regardless — see the note above sectionStyle. */
+  paneOpen: boolean
   mode: ParseMode
   value: string
   onChange: (text: string) => void
@@ -116,21 +118,41 @@ function tryParse(text: string, m: ParseMode): ErrorInfo | null {
   }
 }
 
-export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy, parseError }: RawInputPaneProps) {
+export default function RawInputPane({ paneOpen, mode, value, onChange, onLoadText, onCopy, parseError }: RawInputPaneProps) {
   const [url, setUrl] = useState('')
   const [dragOver, setDragOver] = useState(false)
   const [fetchError, setFetchError] = useState<string | null>(null)
   const [formatError, setFormatError] = useState<string | null>(null)
   const [expanded, setExpanded] = useState(false)
 
+  // Search within the maximized raw view only — independent of the tree
+  // filter, since a huge pasted document is exactly where jumping around the
+  // raw text by hand becomes painful.
+  const [rawQuery, setRawQuery] = useState('')
+  const [rawMatchIdx, setRawMatchIdx] = useState(0)
+  const searchHighlightRef = useRef<HTMLDivElement>(null)
+
+  // "Hide input" collapses the sidebar; if the maximize view happened to be
+  // open, take it down too rather than leaving a fullscreen overlay orphaned
+  // behind a header button that no longer looks like it controls anything.
+  useEffect(() => {
+    if (!paneOpen) setExpanded(false)
+  }, [paneOpen])
+
   useEffect(() => {
     if (!expanded) return
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setExpanded(false)
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      // First Escape clears an active search; only the next one closes the view.
+      if (rawQuery) {
+        setRawQuery('')
+        return
+      }
+      setExpanded(false)
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [expanded])
+  }, [expanded, rawQuery])
 
   // Typing updates `value` at once so the textarea always stays responsive;
   // the expensive derived work below runs against the deferred copy at lower
@@ -139,6 +161,26 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
 
   const bytes = useMemo(() => utf8Length(deferredValue), [deferredValue])
   const sizeLabel = bytes < 1024 ? `${bytes} B` : bytes < 1048576 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1048576).toFixed(2)} MB`
+
+  // Plain indexOf loop rather than a regex — the query is arbitrary user text,
+  // not a pattern, so it must never be interpreted as one.
+  const rawMatches = useMemo(() => {
+    if (!rawQuery) return [] as { start: number; end: number }[]
+    const q = rawQuery.toLowerCase()
+    const lower = deferredValue.toLowerCase()
+    const out: { start: number; end: number }[] = []
+    let i = 0
+    while (i <= lower.length - q.length) {
+      const idx = lower.indexOf(q, i)
+      if (idx < 0) break
+      out.push({ start: idx, end: idx + q.length })
+      i = idx + q.length
+    }
+    return out
+  }, [deferredValue, rawQuery])
+
+  const activeRawMatch = rawMatches.length > 0 ? ((rawMatchIdx % rawMatches.length) + rawMatches.length) % rawMatches.length : -1
+  const rawMatchLabel = rawQuery ? (rawMatches.length ? `${activeRawMatch + 1}/${rawMatches.length}` : 'NO MATCHES') : ''
 
   const validity = useMemo(() => {
     if (!deferredValue.trim()) return { err: null as ErrorInfo | null, empty: true, effectiveMode: mode, checked: true }
@@ -183,10 +225,71 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
     [expanded, highlightTooBig, deferredValue, validity.effectiveMode],
   )
 
+  /**
+   * A second backdrop layered between the syntax colors and the (transparent)
+   * textarea: non-match text is fully transparent so the colors underneath
+   * show through untouched, and only matched spans paint an opaque highlight
+   * over them — the same "found text" look as a code editor's find widget.
+   * It shares the token backdrop's exact font/padding/wrap so both stay
+   * pixel-aligned to the same text.
+   */
+  const rawSearchSegments = useMemo(() => {
+    if (!expanded || !rawQuery || highlightTooBig || rawMatches.length === 0) return null
+    const segs: { text: string; kind: 'plain' | 'match' | 'current' }[] = []
+    let cursor = 0
+    rawMatches.forEach((m, i) => {
+      if (m.start > cursor) segs.push({ text: deferredValue.slice(cursor, m.start), kind: 'plain' })
+      segs.push({ text: deferredValue.slice(m.start, m.end), kind: i === activeRawMatch ? 'current' : 'match' })
+      cursor = m.end
+    })
+    if (cursor < deferredValue.length) segs.push({ text: deferredValue.slice(cursor), kind: 'plain' })
+    return segs
+  }, [expanded, rawQuery, highlightTooBig, rawMatches, activeRawMatch, deferredValue])
+
   const syncHighlightScroll = (e: UIEvent<HTMLTextAreaElement>) => {
-    if (!highlightRef.current) return
-    highlightRef.current.scrollTop = e.currentTarget.scrollTop
-    highlightRef.current.scrollLeft = e.currentTarget.scrollLeft
+    const top = e.currentTarget.scrollTop
+    const left = e.currentTarget.scrollLeft
+    if (highlightRef.current) {
+      highlightRef.current.scrollTop = top
+      highlightRef.current.scrollLeft = left
+    }
+    if (searchHighlightRef.current) {
+      searchHighlightRef.current.scrollTop = top
+      searchHighlightRef.current.scrollLeft = left
+    }
+  }
+
+  useEffect(() => {
+    setRawMatchIdx(0)
+  }, [rawQuery])
+
+  // Marks the active match on the real textarea's selection (so it's already
+  // there if the user tabs over — copy, further edits, everything works on
+  // real text) and scrolls it into view, without moving keyboard focus off
+  // the search field. Deliberately mirrors a browser's own find bar: typing
+  // and Enter/next/prev all keep focus in the search input, never the
+  // document, while the overlay below paints the highlight in sync.
+  useEffect(() => {
+    if (activeRawMatch < 0) return
+    const m = rawMatches[activeRawMatch]
+    const ta = taRef.current
+    if (!ta || !m) return
+    ta.setSelectionRange(m.start, m.end)
+    const lineHeight = expanded ? 14.5 * 1.8 : 12.5 * 1.65
+    const line = deferredValue.slice(0, m.start).split('\n').length - 1
+    ta.scrollTop = Math.max(0, line * lineHeight - ta.clientHeight / 2)
+    ta.dispatchEvent(new Event('scroll'))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRawMatch, rawMatches])
+
+  const gotoNextRawMatch = () => setRawMatchIdx((i) => i + 1)
+  const gotoPrevRawMatch = () => setRawMatchIdx((i) => i - 1)
+
+  const handleRawSearchKey = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key !== 'Enter') return
+    e.preventDefault()
+    if (e.shiftKey) gotoPrevRawMatch()
+    else gotoNextRawMatch()
   }
 
   // Identify what was last loaded by a hash rather than by the text itself —
@@ -282,7 +385,12 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
       }
     : {
         flex: '0 0 380px',
-        display: 'flex',
+        // Hidden via display rather than by unmounting the pane (App.tsx keeps
+        // it mounted across "Hide input" toggles) — an unmount would drop
+        // lastLoadedRef and every other bit of local state, which previously
+        // made toggling the pane back on look like a fresh paste and re-parse
+        // the whole document from scratch.
+        display: paneOpen ? 'flex' : 'none',
         flexDirection: 'column' as const,
         minWidth: 0,
         borderRight: '1px solid var(--app-line)',
@@ -320,6 +428,39 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
           {expanded ? <IconCollapse size={13} /> : <IconExpand size={13} />}
         </button>
       </div>
+
+      {expanded && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '0 12px 8px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 7, flex: '1 1 auto', background: 'var(--app-surface)', border: '1px solid var(--app-line)', borderRadius: 'var(--radius-md)', padding: '0 8px' }}>
+            <IconSearch size={14} />
+            <input
+              id="sb-raw-search"
+              value={rawQuery}
+              onChange={(e) => setRawQuery(e.target.value)}
+              onKeyDown={handleRawSearchKey}
+              placeholder="Search this raw text   ⌘F"
+              style={{ flex: '1 1 auto', border: 0, background: 'transparent', outline: 'none', fontFamily: 'var(--app-mono)', fontSize: 12, color: 'var(--app-ink)', padding: '6px 0' }}
+            />
+            <span style={{ fontFamily: 'var(--app-mono)', fontSize: 10.5, color: 'var(--app-muted)', whiteSpace: 'nowrap' }}>{rawMatchLabel}</span>
+            {rawQuery && (
+              <button
+                onClick={() => setRawQuery('')}
+                title="Clear search"
+                aria-label="Clear search"
+                style={{ border: 0, background: 'transparent', color: 'var(--app-muted)', cursor: 'pointer', fontSize: 14, lineHeight: 1, padding: '2px 2px' }}
+              >
+                ×
+              </button>
+            )}
+          </div>
+          <button className="btn btn-secondary btn-icon" title="Previous match" onClick={gotoPrevRawMatch} style={{ width: 26, height: 26 }}>
+            <IconChevronUp size={13} />
+          </button>
+          <button className="btn btn-secondary btn-icon" title="Next match" onClick={gotoNextRawMatch} style={{ width: 26, height: 26 }}>
+            <IconChevronDown size={13} />
+          </button>
+        </div>
+      )}
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '0 12px 8px' }}>
         <input
@@ -392,13 +533,51 @@ export default function RawInputPane({ mode, value, onChange, onLoadText, onCopy
               {segments.map((seg, i) => (seg.color ? <span key={i} style={{ color: seg.color }}>{seg.text}</span> : seg.text))}
             </div>
           )}
+          {rawSearchSegments && (
+            <div
+              ref={searchHighlightRef}
+              aria-hidden="true"
+              style={{
+                position: 'absolute',
+                inset: 0,
+                margin: 0,
+                overflow: 'auto',
+                pointerEvents: 'none',
+                padding: 12,
+                fontFamily: 'var(--app-mono)',
+                fontSize: 14.5,
+                lineHeight: 1.8,
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word',
+                tabSize: 2,
+                color: 'transparent',
+              }}
+            >
+              {rawSearchSegments.map((seg, i) =>
+                seg.kind === 'plain' ? (
+                  seg.text
+                ) : (
+                  <span
+                    key={i}
+                    style={{
+                      background: seg.kind === 'current' ? 'var(--color-accent-400)' : 'color-mix(in srgb, var(--color-accent-400) 40%, transparent)',
+                      color: 'var(--app-ink)',
+                      borderRadius: 2,
+                    }}
+                  >
+                    {seg.text}
+                  </span>
+                ),
+              )}
+            </div>
+          )}
           <textarea
             className="sb-ta"
             ref={taRef}
             defaultValue={value}
             onChange={handleChange}
             onBlur={handleBlurCommit}
-            onScroll={segments ? syncHighlightScroll : undefined}
+            onScroll={segments || rawSearchSegments ? syncHighlightScroll : undefined}
             spellCheck={false}
             placeholder="Paste JSON or XML — or drop a file here"
             style={{

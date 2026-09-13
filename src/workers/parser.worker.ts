@@ -152,6 +152,10 @@ function handleRequest(msg: WorkerRequest) {
       post({ type: 'MATCH_POSITION', requestId: msg.requestId, position: index.getMatchPosition(msg.matchIndex) })
       return
     }
+    case 'GET_NODE_POSITION': {
+      post({ type: 'NODE_POSITION', requestId: msg.requestId, position: index.getNodePosition(msg.nodeId) })
+      return
+    }
     case 'GET_INSPECTOR_ROWS': {
       const { rows, title } = index.getInspectorRows(msg.nodeId)
       post({ type: 'INSPECTOR_ROWS', requestId: msg.requestId, rows, title })

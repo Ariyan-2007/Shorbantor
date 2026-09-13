@@ -218,9 +218,10 @@ export class FlatNodeIndex implements IndexBuilder {
   private maxDepthSeen = 0
 
   private visibleOrder: Uint32Array = new Uint32Array(0)
+  /** Inverse of visibleOrder (node id -> its row index), kept in step with it so any node's on-screen position is a O(1) lookup instead of a scan. */
+  private positionById: Int32Array = new Int32Array(0)
 
   private activeQuery: string | null = null
-  private searchVisibleOrder: Uint32Array = new Uint32Array(0)
   private searchMatchIds: Int32Array = new Int32Array(0)
   private searchMatchCount = 0
   /** 1 where the node itself matches the active query — computed once per query and reused by the walk, by getNodeView, and by match navigation. */
@@ -475,6 +476,7 @@ export class FlatNodeIndex implements IndexBuilder {
    */
   rebuildVisibleOrder() {
     const out = new Uint32Array(this.nodeCount)
+    const positions = new Int32Array(this.nodeCount).fill(NONE)
     let k = 0
     let id = this.topLevelFirstId
 
@@ -491,11 +493,19 @@ export class FlatNodeIndex implements IndexBuilder {
       id = next
     }
 
+    for (let i = 0; i < k; i++) positions[out[i]] = i
     this.visibleOrder = trimTo(out, k)
+    this.positionById = positions
   }
 
   getVisibleCount(): number {
-    return this.activeQuery ? this.searchVisibleOrder.length : this.visibleOrder.length
+    return this.visibleOrder.length
+  }
+
+  /** Row index of `nodeId` in the current visible order, or -1 if it's not on screen (e.g. a collapsed ancestor hides it). */
+  getNodePosition(nodeId: number): number {
+    if (nodeId < 0 || nodeId >= this.positionById.length) return -1
+    return this.positionById[nodeId]
   }
 
   getTopLevelIds(): number[] {
@@ -518,7 +528,7 @@ export class FlatNodeIndex implements IndexBuilder {
   }
 
   getVisibleSlice(start: number, end: number): FlatNodeView[] {
-    const order = this.activeQuery ? this.searchVisibleOrder : this.visibleOrder
+    const order = this.visibleOrder
     const clampedStart = Math.max(0, start)
     const clampedEnd = Math.min(end, order.length)
     const out: FlatNodeView[] = []
@@ -569,12 +579,19 @@ export class FlatNodeIndex implements IndexBuilder {
     return false
   }
 
+  /**
+   * Scores every node against the query and reveals each match by expanding
+   * its ancestor chain — the rest of the tree stays exactly as the user left
+   * it rather than being hidden. Matches are picked out via `isSearchMatch`
+   * (see getNodeView) and jumped between with getMatchPosition(); nothing here
+   * removes a row from view, so browsing away from a match never requires
+   * clearing the search first.
+   */
   setSearchQuery(query: string): { matchCount: number; visibleCount: number } {
     const q = query.trim().toLowerCase()
     if (!q) {
       this.activeQuery = null
       this.queryBytes = null
-      this.searchVisibleOrder = new Uint32Array(0)
       this.searchMatchIds = new Int32Array(0)
       this.searchMatchCount = 0
       this.selfHit = new Uint8Array(0)
@@ -606,49 +623,28 @@ export class FlatNodeIndex implements IndexBuilder {
     }
     this.selfHit = selfHit
 
-    const out = new Uint32Array(this.nodeCount)
+    // Every ancestor of a match now carries anyHit — expanding exactly those
+    // containers opens a path down to each match without touching branches
+    // that contain no hit at all.
+    for (let id = 0; id < this.nodeCount; id++) {
+      if (anyHit[id] && this.isContainerNode(id)) this.setExpanded(id, true)
+    }
+    this.rebuildVisibleOrder()
+
     const matches = new Int32Array(matchTotal)
     this.matchPositionById.clear()
-    let k = 0
     let m = 0
-
-    // Same allocation-free descend/advance/climb walk as rebuildVisibleOrder,
-    // additionally skipping any subtree that contains no hit at all.
-    const firstHitChild = (id: number): number => {
-      let c = this.firstRowChild(id)
-      while (c !== NONE && !anyHit[c]) c = this.nextRowSibling(c)
-      return c
-    }
-    const nextHitSibling = (id: number): number => {
-      let c = this.nextRowSibling(id)
-      while (c !== NONE && !anyHit[c]) c = this.nextRowSibling(c)
-      return c
-    }
-
-    let id = this.topLevelFirstId
-    while (id !== NONE && !anyHit[id]) id = this.nextSiblingIdArr.get(id)
-
-    while (id !== NONE) {
+    for (let i = 0; i < this.visibleOrder.length; i++) {
+      const id = this.visibleOrder[i]
       if (selfHit[id]) {
         matches[m++] = id
-        this.matchPositionById.set(id, k)
+        this.matchPositionById.set(id, i)
       }
-      out[k++] = id
-
-      let next = this.isContainerNode(id) ? firstHitChild(id) : NONE
-      if (next === NONE) {
-        for (let cur = id; cur !== NONE; cur = this.parentIdArr.get(cur)) {
-          next = nextHitSibling(cur)
-          if (next !== NONE) break
-        }
-      }
-      id = next
     }
 
-    this.searchVisibleOrder = trimTo(out, k)
     this.searchMatchIds = m === matches.length ? matches : matches.slice(0, m)
     this.searchMatchCount = m
-    return { matchCount: m, visibleCount: k }
+    return { matchCount: m, visibleCount: this.visibleOrder.length }
   }
 
   /** O(1): positions were recorded during the filtered walk rather than re-scanned per jump. */
@@ -718,7 +714,7 @@ export class FlatNodeIndex implements IndexBuilder {
     const typeCode = this.nodeTypeArr.get(id)
     const type = NODE_TYPE_NAMES[typeCode]
     const isContainer = this.isContainerNode(id)
-    const isExpanded = this.activeQuery ? isContainer : this.isExpanded(id)
+    const isExpanded = this.isExpanded(id)
 
     let valueText: string
     let valueColorToken: ColorToken

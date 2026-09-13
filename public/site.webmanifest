@@ -1,0 +1,17 @@
+{
+  "name": "Shorbantor — JSON / XML Inspector",
+  "short_name": "Shorbantor",
+  "description": "Fast, private, in-browser JSON and XML viewer with a searchable tree, syntax highlighting, and instant prettify — no upload, no server.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#150a29",
+  "theme_color": "#7e14ff",
+  "orientation": "any",
+  "icons": [
+    { "src": "/favicon-48.png", "sizes": "48x48", "type": "image/png" },
+    { "src": "/android-chrome-192x192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/android-chrome-512x512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/maskable-icon-512x512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

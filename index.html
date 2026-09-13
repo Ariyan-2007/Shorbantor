@@ -2,15 +2,97 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+
+    <!-- Primary SEO -->
+    <title>Shorbantor — Free JSON &amp; XML Viewer, Formatter and Tree Inspector</title>
+    <meta
+      name="description"
+      content="Shorbantor is a free, private, in-browser JSON and XML viewer. Instantly prettify, search, and explore huge files in a fast, collapsible tree — no upload, no server, 100% client-side."
+    />
+    <meta
+      name="keywords"
+      content="json viewer, xml viewer, json formatter, json prettify, json beautifier, xml formatter, json tree viewer, online json editor, xml parser online, large json viewer, json inspector, xml inspector"
+    />
+    <meta name="author" content="Ariyan" />
+    <meta name="robots" content="index, follow, max-image-preview:large" />
+    <link rel="canonical" href="https://shorbantor.ariyan.app/" />
+
+    <!-- Viewport / theme -->
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#7e14ff" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="application-name" content="Shorbantor" />
+    <meta name="apple-mobile-web-app-title" content="Shorbantor" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+
+    <!-- Icons / branding -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+    <link rel="manifest" href="/site.webmanifest" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Shorbantor" />
+    <meta property="og:url" content="https://shorbantor.ariyan.app/" />
+    <meta property="og:title" content="Shorbantor — Free JSON &amp; XML Viewer, Formatter and Tree Inspector" />
+    <meta
+      property="og:description"
+      content="Instantly prettify, search, and explore huge JSON &amp; XML files in a fast, collapsible tree. No upload, no server — 100% private and client-side."
+    />
+    <meta property="og:image" content="https://shorbantor.ariyan.app/og-image.png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Shorbantor — JSON / XML Inspector" />
+    <meta property="og:locale" content="en_US" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Shorbantor — Free JSON &amp; XML Viewer, Formatter and Tree Inspector" />
+    <meta
+      name="twitter:description"
+      content="Instantly prettify, search, and explore huge JSON &amp; XML files in a fast, collapsible tree. No upload, no server — 100% private and client-side."
+    />
+    <meta name="twitter:image" content="https://shorbantor.ariyan.app/og-image.png" />
+    <meta name="twitter:image:alt" content="Shorbantor — JSON / XML Inspector" />
+
+    <!-- Structured data -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "Shorbantor",
+        "url": "https://shorbantor.ariyan.app/",
+        "description": "Free, private, in-browser JSON and XML viewer. Instantly prettify, search, and explore huge files in a fast, collapsible tree — no upload, no server, 100% client-side.",
+        "applicationCategory": "DeveloperApplication",
+        "operatingSystem": "Any",
+        "browserRequirements": "Requires a modern web browser",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD"
+        },
+        "featureList": [
+          "JSON tree viewer",
+          "XML tree viewer",
+          "Instant prettify / format",
+          "Search keys and values",
+          "Large file support",
+          "100% client-side, no upload"
+        ]
+      }
+    </script>
+
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@600;700&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
-    <title>Shorbantor</title>
   </head>
   <body>
     <div id="root"></div>

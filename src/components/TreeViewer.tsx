@@ -25,7 +25,6 @@ interface TreeViewerProps {
   onCopyPath: (node: FlatNodeView) => void
   onCopySubtree: (node: FlatNodeView) => void
   onCopyValue: (node: FlatNodeView) => void
-  query: string
   jumpToIndex: { index: number; token: number } | null
 }
 
@@ -45,7 +44,6 @@ export default function TreeViewer({
   onCopyPath,
   onCopySubtree,
   onCopyValue,
-  query,
   jumpToIndex,
 }: TreeViewerProps) {
   const parentRef = useRef<HTMLDivElement>(null)
@@ -130,9 +128,7 @@ export default function TreeViewer({
       <div style={{ flex: '1 1 auto', overflow: 'auto', background: 'var(--app-surface)' }}>
         <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 10, height: '60vh', color: 'var(--app-muted)' }}>
           <IconEmpty size={34} />
-          <div style={{ fontFamily: 'var(--app-mono)', fontSize: 12, letterSpacing: '0.06em' }}>
-            {query ? `NO NODES MATCH “${query}”` : 'NOTHING TO INSPECT YET'}
-          </div>
+          <div style={{ fontFamily: 'var(--app-mono)', fontSize: 12, letterSpacing: '0.06em' }}>NOTHING TO INSPECT YET</div>
         </div>
       </div>
     )

@@ -50,6 +50,7 @@ export default function App() {
     getVisibleNodes,
     search,
     getMatchPosition,
+    getNodePosition,
     getInspectorRows,
     getAncestorChain,
     getSubtreeText,
@@ -251,7 +252,17 @@ export default function App() {
     [matchIdx, matchCount, getMatchPosition],
   )
 
-  const matchLabel = query.trim() ? (matchCount ? `${Math.min(matchIdx + 1, matchCount)}/${matchCount}` : '0') : ''
+  const matchLabel = query.trim() ? (matchCount ? `${Math.min(matchIdx + 1, matchCount)}/${matchCount}` : 'NO MATCHES') : ''
+
+  const handleSelectCrumb = useCallback(
+    async (nodeId: number) => {
+      setSelectedNodeId(nodeId)
+      setSelectedPath(await getNodePath(nodeId))
+      const position = await getNodePosition(nodeId)
+      if (position >= 0) setJumpToIndex({ index: position, token: Date.now() })
+    },
+    [getNodePath, getNodePosition],
+  )
 
   // ---- keyboard shortcuts + responsive ---------------------------------------
 
@@ -261,10 +272,16 @@ export default function App() {
       const typing = !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'f') {
         e.preventDefault()
-        document.getElementById('sb-search')?.focus()
+        // The raw-input maximize view has its own search field; while it's open
+        // that's what ⌘F should reach, not the tree filter behind it.
+        const rawSearch = document.getElementById('sb-raw-search') as HTMLInputElement | null
+        ;(rawSearch ?? document.getElementById('sb-search'))?.focus()
         return
       }
       if (typing) return
+      // Only bare key presses trigger these — otherwise Cmd/Ctrl+C (copy) or
+      // Cmd/Ctrl+E collapsed or expanded the whole tree out from under a copy.
+      if (e.metaKey || e.ctrlKey || e.altKey) return
       if (e.key.toLowerCase() === 'e') expandToDepth(Number.POSITIVE_INFINITY)
       else if (e.key.toLowerCase() === 'c') expandToDepth(0)
     }
@@ -308,19 +325,19 @@ export default function App() {
         onNextMatch={() => jump(1)}
         crumbs={crumbs}
         onCopyCrumbPath={handleCopySelectedPath}
+        onSelectCrumb={handleSelectCrumb}
       />
 
       <main style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
-        {paneOpen && (
-          <RawInputPane
-            mode={mode}
-            value={rawText}
-            onChange={setRawText}
-            onLoadText={handleLoadText}
-            onCopy={copy}
-            parseError={status === 'error' ? error : null}
-          />
-        )}
+        <RawInputPane
+          paneOpen={paneOpen}
+          mode={mode}
+          value={rawText}
+          onChange={setRawText}
+          onLoadText={handleLoadText}
+          onCopy={copy}
+          parseError={status === 'error' ? error : null}
+        />
 
         <section style={{ flex: '1 1 auto', display: 'flex', flexDirection: 'column', minWidth: 0, background: 'var(--app-surface)' }}>
           <div style={{ flex: '1 1 auto', display: 'flex', minHeight: 0 }}>
@@ -342,7 +359,6 @@ export default function App() {
                 onCopyPath={handleRowCopyPath}
                 onCopySubtree={handleRowCopySubtree}
                 onCopyValue={handleRowCopyValue}
-                query={query}
                 jumpToIndex={jumpToIndex}
               />
             )}

@@ -78,6 +78,7 @@ export type WorkerRequest =
   | { type: 'EXPAND_TO_DEPTH'; depth: number }
   | { type: 'SET_SEARCH'; requestId: number; query: string }
   | { type: 'GET_MATCH_POSITION'; requestId: number; matchIndex: number }
+  | { type: 'GET_NODE_POSITION'; requestId: number; nodeId: number }
   | { type: 'GET_INSPECTOR_ROWS'; requestId: number; nodeId: number | null }
   | { type: 'GET_ANCESTOR_CHAIN'; requestId: number; nodeId: number | null }
   | { type: 'GET_SUBTREE_TEXT'; requestId: number; nodeId: number }
@@ -99,6 +100,7 @@ export type WorkerResponse =
   | { type: 'VISIBLE_COUNT_CHANGED'; visibleCount: number }
   | { type: 'SEARCH_RESULT'; requestId: number; matchCount: number; visibleCount: number }
   | { type: 'MATCH_POSITION'; requestId: number; position: number }
+  | { type: 'NODE_POSITION'; requestId: number; position: number }
   | { type: 'INSPECTOR_ROWS'; requestId: number; rows: InspectorRow[]; title: string }
   | { type: 'ANCESTOR_CHAIN'; requestId: number; crumbs: AncestorCrumb[] }
   | { type: 'SUBTREE_TEXT'; requestId: number; text: string }

@@ -28,6 +28,7 @@ export interface UseShorbantorParserResult {
   getVisibleNodes: (start: number, end: number) => Promise<FlatNodeView[]>
   search: (query: string) => Promise<{ matchCount: number; visibleCount: number }>
   getMatchPosition: (matchIndex: number) => Promise<number>
+  getNodePosition: (nodeId: number) => Promise<number>
   getInspectorRows: (nodeId: number | null) => Promise<{ rows: InspectorRow[]; title: string }>
   getAncestorChain: (nodeId: number | null) => Promise<AncestorCrumb[]>
   getSubtreeText: (nodeId: number) => Promise<string>
@@ -182,6 +183,16 @@ export function useShorbantorParser(): UseShorbantorParserResult {
     [request],
   )
 
+  const getNodePosition = useCallback(
+    (nodeId: number) =>
+      request<Extract<WorkerResponse, { type: 'NODE_POSITION' }>, number>(
+        (requestId) => ({ type: 'GET_NODE_POSITION', requestId, nodeId }),
+        (msg) => msg.position,
+        -1,
+      ),
+    [request],
+  )
+
   const getInspectorRows = useCallback(
     (nodeId: number | null) =>
       request<Extract<WorkerResponse, { type: 'INSPECTOR_ROWS' }>, { rows: InspectorRow[]; title: string }>(
@@ -248,6 +259,7 @@ export function useShorbantorParser(): UseShorbantorParserResult {
     getVisibleNodes,
     search,
     getMatchPosition,
+    getNodePosition,
     getInspectorRows,
     getAncestorChain,
     getSubtreeText,
