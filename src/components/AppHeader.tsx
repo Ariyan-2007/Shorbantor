@@ -69,7 +69,11 @@ export default function AppHeader({
     <>
       <header style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '10px 14px', borderBottom: '1px solid var(--app-line)', background: 'var(--app-surface)', flex: '0 0 auto' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginRight: 6 }}>
-          <img src="/favicon.svg" alt="Shorbantor logo" width={22} height={21} style={{ flex: '0 0 auto', display: 'block' }} />
+          <svg width="26" height="26" viewBox="0 0 48 48" fill="none" aria-hidden="true" style={{ flex: '0 0 auto' }}>
+            <rect x="1.5" y="1.5" width="45" height="45" stroke="var(--color-accent)" strokeWidth="2" />
+            <path d="M17 12h-5v24h5M31 12h5v24h-5" stroke="var(--color-accent-800)" strokeWidth="3" strokeLinecap="square" />
+            <path d="M21 19h8M24 29h5" stroke="var(--color-accent)" strokeWidth="3" strokeLinecap="square" />
+          </svg>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
             <span style={{ fontFamily: 'var(--font-heading)', fontWeight: 700, fontSize: 20, letterSpacing: '0.06em', textTransform: 'uppercase' }}>Shorbantor</span>
             <span style={{ fontFamily: 'var(--app-mono)', fontSize: 10, letterSpacing: '0.12em', color: 'var(--app-muted)' }}>JSON / XML INSPECTOR</span>
